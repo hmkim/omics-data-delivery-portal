@@ -33,7 +33,7 @@ test('zip cancel leaves the running state; logo loads; no page/console errors', 
   await selectFile(row);
   await openZipView(page);
   await page.getByRole('button', { name: 'zip 다운로드 시작' }).click();
-  const streaming = page.getByText(/zip 생성 중/);
+  const streaming = page.getByText(/zip 스트리밍 중/);
   await expect(streaming).toHaveText(/MiB/, { timeout: 60_000 }); // streaming phase, body open
   await page.getByRole('button', { name: '취소' }).click();
 

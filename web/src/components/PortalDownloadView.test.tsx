@@ -64,7 +64,7 @@ describe('PortalDownloadView cancel (R4.9)', () => {
     await act(async () => {
       onProgress?.({ issued: 1, filesDone: 0, bytesDone: 8 * 1024 ** 2, total: 1, phase: 'streaming' });
     });
-    expect(screen.getByText(/zip 생성 중/)).toBeInTheDocument();
+    expect(screen.getByText(/zip 스트리밍 중/)).toBeInTheDocument();
 
     // cancel: runZip resolves, then one more chunk is reported in the same tick
     fireEvent.click(screen.getByRole('button', { name: '취소' }));

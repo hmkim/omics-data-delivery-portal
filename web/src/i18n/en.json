@@ -121,7 +121,7 @@
     "cancel": "Cancel",
     "exit": "Close",
     "preparing": "Issuing URLs ({{done}}/{{total}})…",
-    "streaming": "Building zip: {{done}}/{{total}} files, {{bytes}}",
+    "streaming": "Streaming zip (browser download in progress, no compression): {{done}}/{{total}} files, {{bytes}}",
     "complete": "The zip download is complete.",
     "failed": "Zip creation was interrupted. Zip streams cannot be resumed, so it must be created again.",
     "authExpired": "Zip creation stopped because the session ended. Sign in again and create it again.",
