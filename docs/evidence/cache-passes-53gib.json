@@ -1,0 +1,20 @@
+{
+  "object": "sample-53gib.bin",
+  "uriStem": "/projects/DEMO-0001/sample-53gib.bin",
+  "passes": [
+    {
+      "downloadId": "418c2fdf-93f5-44f5-b74e-a9e4cfea2289",
+      "path": "CF",
+      "startedAt": "2026-09-29T05:09:23.782Z",
+      "completedAt": "2026-09-29T05:26:56.302Z",
+      "url": "https://d222222abcdef8.cloudfront.net/projects/DEMO-0001/sample-53gib.bin"
+    },
+    {
+      "downloadId": "2bb20e08-333b-428d-98ab-596f5d3cc025",
+      "path": "CF",
+      "startedAt": "2026-09-29T05:30:59.898Z",
+      "completedAt": "2026-09-29T05:49:15.182Z",
+      "url": "https://d222222abcdef8.cloudfront.net/projects/DEMO-0001/sample-53gib.bin"
+    }
+  ]
+}

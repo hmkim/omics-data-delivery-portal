@@ -1,0 +1,36 @@
+name: pr
+
+# T7.7 — offline gate on every pull request: lint, prettier, typecheck, unit tests, web build, cdk synth + cdk-nag.
+# No AWS credentials; the synth uses the placeholder account (see infra/package.json "synth").
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: PR gate
+        run: ci/pr.sh
+      - name: cdk-nag reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cdk-nag-reports
+          path: infra/cdk.out/*NagReport.csv
+          if-no-files-found: ignore
+          retention-days: 14

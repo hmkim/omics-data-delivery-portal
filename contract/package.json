@@ -1,0 +1,17 @@
+{
+  "name": "@genome-portal/contract",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Single source of truth for thresholds, SSM parameter names, config.json shape and API request/response types",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  }
+}

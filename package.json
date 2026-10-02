@@ -1,0 +1,40 @@
+{
+  "name": "omics-data-delivery-portal",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT-0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hmkim/omics-data-delivery-portal.git"
+  },
+  "homepage": "https://github.com/hmkim/omics-data-delivery-portal#readme",
+  "description": "Omics data delivery portal: Storage Browser for S3 + Cognito + S3 Access Grants + CloudFront",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "contract",
+    "infra",
+    "web",
+    "tools"
+  ],
+  "scripts": {
+    "lint": "eslint . --max-warnings 0",
+    "format": "prettier --check .",
+    "format:write": "prettier --write .",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present",
+    "synth": "npm run synth -w infra",
+    "admin": "npm run admin -w tools --"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@types/node": "^22.0.0",
+    "eslint": "^9.0.0",
+    "prettier": "^3.0.0",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^3.0.0"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["bin/**/*.ts", "lib/**/*.ts", "lambda/**/*.ts", "test/**/*.ts"],
+  "exclude": ["cdk.out", "node_modules"]
+}

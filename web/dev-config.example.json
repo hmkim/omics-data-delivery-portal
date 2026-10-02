@@ -1,0 +1,17 @@
+{
+  "region": "ap-northeast-2",
+  "accountId": "111111111111",
+  "userPoolId": "ap-northeast-2_XXXXXXXXX",
+  "clientId": "xxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "apiBase": "/api",
+  "dataBucket": "genome-portal-data-111111111111-ap-northeast-2",
+  "cfDomain": "dxxxxxxxxxxxxx.cloudfront.net",
+  "splitThresholdBytes": 1073741824,
+  "singleObjectLimitBytes": 50000000000,
+  "mfaMode": "REQUIRED",
+  "brand": {
+    "name": "Genome Data Portal",
+    "logoUrl": "/brand/logo.svg",
+    "primaryColor": "#0B5FFF"
+  }
+}

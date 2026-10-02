@@ -1,0 +1,32 @@
+# dependencies / build
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# CDK
+cdk.out/
+cdk.context.json
+infra/config/*.local.json
+
+# local env / secrets (never commit)
+.env
+.env.*
+*.pem
+*.key
+.genome-portal/
+tools/admin.config.json
+web/dev-config.json
+
+# test artifacts
+web/e2e/test-results/
+web/e2e/playwright-report/
+web/e2e/.auth/
+web/e2e/user-login.txt
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json

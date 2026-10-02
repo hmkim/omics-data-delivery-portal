@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" width="40" height="40" role="img" aria-label="">
+  <!-- Default portal mark (neutral double helix). Replace per deployment via infra/config/<env>.json brand.logoFile. -->
+  <rect x="2" y="2" width="36" height="36" rx="8" fill="#0f6cbd"/>
+  <g fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round">
+    <path d="M13 7 C13 13 27 15 27 20 C27 25 13 27 13 33"/>
+    <path d="M27 7 C27 13 13 15 13 20 C13 25 27 27 27 33"/>
+  </g>
+  <g stroke="#ffffff" stroke-width="2" stroke-linecap="round" opacity="0.85">
+    <line x1="15.2" y1="10.5" x2="24.8" y2="10.5"/>
+    <line x1="18.6" y1="15.5" x2="21.4" y2="15.5"/>
+    <line x1="18.6" y1="24.5" x2="21.4" y2="24.5"/>
+    <line x1="15.2" y1="29.5" x2="24.8" y2="29.5"/>
+  </g>
+</svg>

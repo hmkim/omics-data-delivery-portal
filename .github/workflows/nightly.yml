@@ -1,0 +1,86 @@
+name: nightly-dev
+
+# T7.7 — M6 integration tests + M7 Playwright e2e against the dev account, every night (03:00 KST = 18:00 UTC).
+# Cost per run ≈ $4–6 (≈ 60 GiB of CloudFront/S3 transfer: 12 GiB × ~5 e2e passes); runbook §4 tracks it.
+# Repository configuration (ci/README.md):
+#   variable DEV_CI_ROLE_ARN   IAM role from ci/github-oidc-role.yaml (OIDC trust for this repository)
+#   secret   E2E_PORTAL_USER   "<portal test user e-mail>\n<password>" — a user without TOTP in the dev user pool
+on:
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      integ:
+        description: run the M6 integration suite
+        type: boolean
+        default: true
+      e2e:
+        description: run the M7 Playwright suite
+        type: boolean
+        default: true
+      big_file:
+        description: cache-test object (sample-53gib.bin ≈ $5–6 per pass)
+        type: choice
+        options: [sample-12gib.bin, sample-53gib.bin]
+        default: sample-12gib.bin
+
+concurrency:
+  group: nightly-dev
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  dev:
+    # No-op until the repository variable DEV_CI_ROLE_ARN is configured (ci/README.md), so a fresh clone or fork
+    # does not fail every night.
+    if: ${{ vars.DEV_CI_ROLE_ARN != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: dev
+    env:
+      AWS_REGION: ap-northeast-2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEV_CI_ROLE_ARN }}
+          role-session-name: genome-portal-nightly-${{ github.run_id }}
+          aws-region: ap-northeast-2
+          role-duration-seconds: 10800
+      - name: temp dir on the large runner disk
+        # Chromium keeps its profile and the split engine's OPFS swap file in $TMPDIR; the root disk of a hosted
+        # runner (~14 GB free) cannot hold 2 × 12 GiB, /mnt (~70 GB) can. playwright.config.ts refuses to start
+        # when the temp dir has < 30 GB free.
+        run: |
+          sudo mkdir -p /mnt/e2e-tmp && sudo chown "$USER" /mnt/e2e-tmp
+          echo "TMPDIR=/mnt/e2e-tmp" >> "$GITHUB_ENV"
+          df -h /mnt/e2e-tmp
+      - name: nightly (integration + e2e)
+        env:
+          NIGHTLY_INTEG: ${{ github.event_name == 'schedule' && '1' || (inputs.integ && '1' || '0') }}
+          NIGHTLY_E2E: ${{ github.event_name == 'schedule' && '1' || (inputs.e2e && '1' || '0') }}
+          E2E_BIG_FILE: ${{ inputs.big_file || 'sample-12gib.bin' }}
+          E2E_PORTAL_USER: ${{ secrets.E2E_PORTAL_USER }}
+          CI_OUTPUT_DIR: ${{ github.workspace }}/ci-output
+        run: ci/nightly.sh
+      - name: reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-dev-${{ github.run_id }}
+          path: |
+            ci-output/integ.log
+            ci-output/e2e.log
+            ci-output/e2e/results.json
+            ci-output/e2e/cache-passes.json
+            ci-output/e2e/playwright-report/
+            ci-output/e2e/test-results/**/trace.zip
+          if-no-files-found: ignore
+          retention-days: 30

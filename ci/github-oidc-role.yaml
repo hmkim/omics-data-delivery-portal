@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  genome-portal CI (T7.7): GitHub Actions OIDC provider + the role the nightly job assumes in the dev account.
+  Deployed once by an operator (not part of the CDK app): the role ARN becomes the repository variable
+  DEV_CI_ROLE_ARN. After creating it, add the role ARN to uploaderPrincipalArns in infra/config/dev.json and
+  redeploy genome-portal-data, otherwise the data bucket policy denies the role's PutObject/GetObject.
+
+Parameters:
+  GitHubRepository:
+    Type: String
+    Description: '"<owner>/<repo>" allowed to assume the role (branches and workflow_dispatch of that repo only)'
+    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+  CreateOidcProvider:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'false when the account already has token.actions.githubusercontent.com registered'
+  ResourcePrefix:
+    Type: String
+    Default: genome-portal
+    Description: 'resource name prefix shared with the CDK app (N7)'
+
+Conditions:
+  NewProvider: !Equals [!Ref CreateOidcProvider, 'true']
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: NewProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      # GitHub's OIDC certificate is validated through its root CA since 2023; the thumbprint is not used by STS
+      # any more but the property is still required.
+      ThumbprintList: [ffffffffffffffffffffffffffffffffffffffff]
+
+  NightlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-ci-nightly'
+      Description: genome-portal nightly integration + e2e job (GitHub Actions OIDC)
+      MaxSessionDuration: 14400
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - NewProvider
+                - !Ref GitHubOidcProvider
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubRepository}:*'
+      Policies:
+        - PolicyName: nightly-dev-tests
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StackOutputs
+                Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Sub 'arn:aws:cloudformation:*:${AWS::AccountId}:stack/${ResourcePrefix}-*/*'
+              - Sid: TestUsers
+                Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminAddUserToGroup
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminUserGlobalSignOut
+                  - cognito-idp:DescribeUserPool
+                  - cognito-idp:DescribeUserPoolClient
+                Resource: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*'
+              - Sid: DataBucketFixtures
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:GetObjectAttributes
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ResourcePrefix}-data-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:aws:s3:::${ResourcePrefix}-data-${AWS::AccountId}-${AWS::Region}/projects/INTEG-*'
+                  - !Sub 'arn:aws:s3:::${ResourcePrefix}-data-${AWS::AccountId}-${AWS::Region}/projects/PERF-1000/*'
+                  - !Sub 'arn:aws:s3:::${ResourcePrefix}-data-${AWS::AccountId}-${AWS::Region}/projects/DEMO-0001/*'
+              - Sid: DataBucketKms
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 's3.${AWS::Region}.amazonaws.com'
+              - Sid: AccessGrantsReadOnly
+                Effect: Allow
+                Action:
+                  - s3:ListAccessGrants
+                  - s3:ListAccessGrantsLocations
+                  - s3:GetAccessGrant
+                Resource: !Sub 'arn:aws:s3:${AWS::Region}:${AWS::AccountId}:access-grants/default'
+              - Sid: RuntimeSettings
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ResourcePrefix}/*'
+              - Sid: OpsDaily
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourcePrefix}-ops-daily'
+              - Sid: LedgerFixtures
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourcePrefix}-*'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourcePrefix}-*/index/*'
+              - Sid: OriginVerifySecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ResourcePrefix}/*'
+              - Sid: Observability
+                Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:GetMetricData
+                Resource: '*'
+              - Sid: AthenaLogs
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:GetWorkGroup
+                Resource: !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${ResourcePrefix}-ops'
+              - Sid: GlueCatalog
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${ResourcePrefix}-logs'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${ResourcePrefix}-logs/*'
+              - Sid: AthenaBuckets
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ResourcePrefix}-athena-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::${ResourcePrefix}-athena-${AWS::AccountId}/results/*'
+                  - !Sub 'arn:aws:s3:::${ResourcePrefix}-cf-logs-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::${ResourcePrefix}-cf-logs-${AWS::AccountId}/*'
+
+Outputs:
+  RoleArn:
+    Description: set as repository variable DEV_CI_ROLE_ARN; add to uploaderPrincipalArns in infra/config/dev.json
+    Value: !GetAtt NightlyRole.Arn

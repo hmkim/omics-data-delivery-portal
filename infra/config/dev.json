@@ -1,0 +1,10 @@
+{
+  "region": "ap-northeast-2",
+  "mfaMode": "OPTIONAL",
+  "alertEmail": "alerts@example.org",
+  "brand": {
+    "name": "Genome Data Portal",
+    "logoUrl": "/brand/logo.svg",
+    "primaryColor": "#0f6cbd"
+  }
+}
