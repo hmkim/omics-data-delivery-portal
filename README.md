@@ -10,7 +10,7 @@ All AWS resource identifiers use the `genome-portal-` prefix.
 Design documents (Korean): [`docs/spec/requirements.md`](docs/spec/requirements.md) and
 [`docs/spec/design.md`](docs/spec/design.md). The `R#`, `N#`, `D#` and `§#` references in code, tests and docs point
 into those two files. The design decisions and what the dev verification found are written up in the blog post
-(Korean): [AWS PS Tech Blog](https://www.aws-ps-tech.kr/link/118).
+(Korean): [AWS PS Tech Blog](https://www.aws-ps-tech.kr/link/118), summarised in the [Blog post](#blog-post) section below.
 
 > Reference implementation, verified end to end on a development account (`docs/acceptance.md`). Read the
 > [security review](docs/security-review.md) and the [runbook](docs/runbook.md) before pointing it at real data, and
@@ -153,6 +153,40 @@ npm run typecheck -w tools
 npm test -w tools                         # argument parsing, CSV escaping, day-range expansion, pagination (mocked fetch), token cache
 bash -n tools/seed.sh tools/teardown.sh   # shell syntax
 ```
+
+## Blog post
+
+The design is written up in Korean on the AWS PS Tech Blog:
+[Storage Browser for S3와 CloudFront 정액제로 수백 GB 유전체 데이터 배포 포털 만들기](https://www.aws-ps-tech.kr/link/118). The post walks
+through the problem, the architecture and each design decision with the browser and AWS mechanics behind it, and ends
+with the measurements, the cost model and a glossary. In short:
+
+- **Why not presigned URLs by e-mail.** A presigned URL is checked only when a request reaches S3, so a transfer that
+  is already running survives expiry, but every reconnect after expiry fails. Repeat downloads are metered each time,
+  and nobody can see who downloaded what.
+- **Browse and permissions.** Storage Browser (customer-managed auth) shows the folders; S3 Access Grants computes the
+  scope. One delivery location is one grant, and the Lambda functions hold no S3 permissions of their own, so every
+  download leaves a `GetDataAccess` CloudTrail event carrying user, organisation and download id. A presigned URL
+  signed with a one-object credential whose `DurationSeconds` equals the URL TTL expires exactly when the URL does.
+- **Routing rule.** A DynamoDB `ADD` with `ReturnValues: ALL_OLD` decides "first download via S3, every later one via
+  CloudFront"; the threshold is an SSM parameter (0 = everything via CloudFront). Bucket CORS is `AllowedOrigins: *`
+  because the managed cache policy does not key on `Origin`, so the origin's answer must not depend on it.
+- **Split downloads above 50 GB.** 8 GiB Range parts, four in parallel, written into OPFS through
+  `FileSystemSyncAccessHandle` so that progress always equals the bytes durably on disk (the File System Access API
+  writes to a swap file that only becomes the real file on `close()`). Browsers with `showSaveFilePicker` merge the
+  parts into the chosen file; browsers without it (Firefox, Safari, Brave, iOS) hand the verified parts to the
+  browser's own download through a service-worker stream or a Blob. Quota is probed with `truncate()`, not
+  `estimate()`. Measured on the dev account: a 53 GiB object passed CloudFront as 7 parts (Miss 7/7 on the first pass,
+  Hit 7/7 on the second) with a matching full-object CRC32.
+- **zip is a bundle, not compression.** STORE mode, streamed through a service worker; CloudFront only ever sees
+  per-file GETs. Cancellation must settle (client-zip never calls `return()` on the entry generator).
+- **Flat-rate plan as code.** `AWS::PricingPlanManager::Subscription`. A paid tier is created `PENDING_APPROVAL`;
+  approval is manual and cannot be undone until the billing cycle ends. Pro allows managed policies only, and Parquet
+  log delivery is billed outside the plan.
+- **Operations.** Standard logging v2 delivery resources live in us-east-1, every Parquet field is a string, ten alarms
+  go to SNS, and the topic policy must explicitly allow CloudWatch to publish.
+- **Cost.** Everything via CloudFront is $15/month at any volume; the only metered item is the first-download S3
+  egress, kept as a lever for the 50 TB monthly allowance rather than as a saving.
 
 ## License
 
