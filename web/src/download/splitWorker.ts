@@ -106,11 +106,21 @@ export interface DurableSink {
   close(): void;
 }
 
+/**
+ * The origin's storage quota is exhausted. Chromium/Safari throw `QuotaExceededError`; Firefox surfaces the
+ * quota check inside `FileSystemSyncAccessHandle.truncate()` as an XPCOM exception named
+ * `NS_ERROR_FILE_NO_DEVICE_SPACE` ("File error: No device space"; Firefox 155, 2026-10-14 probe) — it is not a
+ * `DOMException` and does not say "quota".
+ */
 export function isQuotaError(err: unknown): boolean {
-  return (
-    (err instanceof DOMException && err.name === 'QuotaExceededError') ||
-    (err instanceof Error && /quota/i.test(err.name + err.message))
-  );
+  if (err instanceof DOMException && err.name === 'QuotaExceededError') return true;
+  const text =
+    err instanceof Error
+      ? `${err.name} ${err.message}`
+      : typeof err === 'object' && err !== null
+        ? `${String((err as { name?: unknown }).name ?? '')} ${String((err as { message?: unknown }).message ?? '')} ${String(err)}`
+        : String(err);
+  return /quota|NS_ERROR_FILE_NO_DEVICE_SPACE|no device space/i.test(text);
 }
 
 /**

@@ -64,6 +64,7 @@ export function DownloadPanel({
               if (confirm(t('panel.cancelConfirm'))) void engine.cancel(snap.record.downloadId);
             }}
             onRemove={() => void engine.remove(snap.record.downloadId)}
+            onExportAgain={() => void engine.exportAgain(snap.record.downloadId)}
           />
         ))}
       </Flex>
@@ -78,6 +79,7 @@ interface RowProps {
   onResume: () => void;
   onCancel: () => void;
   onRemove: () => void;
+  onExportAgain: () => void;
 }
 
 function statusVariation(
@@ -95,15 +97,35 @@ function statusVariation(
   }
 }
 
-function DownloadRow({ snap, lang, onPause, onResume, onCancel, onRemove }: RowProps) {
+function DownloadRow({ snap, lang, onPause, onResume, onCancel, onRemove, onExportAgain }: RowProps) {
   const { t } = useTranslation();
-  const { record, receivedBytes, partsDone, speedBps, etaSeconds, mergeProgress, verifyProgress } = snap;
+  const {
+    record,
+    receivedBytes,
+    partsDone,
+    speedBps,
+    etaSeconds,
+    mergeProgress,
+    exportProgress,
+    verifyProgress,
+  } = snap;
   const percent = record.size > 0 ? Math.floor((receivedBytes / record.size) * 100) : 0;
   const isRunning = record.status === 'running';
   const isMerging = record.status === 'merging';
+  const isExporting = record.status === 'exporting';
   const isPaused = record.status === 'paused';
   const isFinal = record.status === 'complete' || record.status === 'failed';
   const storage = record.storage ?? 'direct';
+  const delivery = record.delivery ?? 'picker';
+  // a Blob export keeps its part files until the entry is removed (the browser is still writing its copy)
+  const keepsParts = delivery === 'export' && record.status === 'complete' && record.exportMode === 'blob';
+  const stageProgress = isMerging ? mergeProgress : isExporting ? exportProgress : undefined;
+  const reasonText =
+    record.reason && delivery === 'export' && record.reason === 'STORAGE_QUOTA'
+      ? t('panel.reasonExport.STORAGE_QUOTA')
+      : record.reason
+        ? t(`panel.reason.${record.reason}`)
+        : '';
 
   return (
     <View
@@ -116,6 +138,8 @@ function DownloadRow({ snap, lang, onPause, onResume, onCancel, onRemove }: RowP
       data-parts={record.parts.length}
       data-renew-count={record.renewCount}
       data-storage={storage}
+      data-delivery={delivery}
+      data-export-mode={record.exportMode ?? ''}
     >
       <Flex direction="row" justifyContent="space-between" alignItems="center" wrap="wrap" gap="0.5rem">
         <Text fontWeight="bold" style={{ wordBreak: 'break-all' }}>
@@ -130,7 +154,7 @@ function DownloadRow({ snap, lang, onPause, onResume, onCancel, onRemove }: RowP
       </Text>
       <Loader
         variation="linear"
-        percentage={isMerging && mergeProgress !== undefined ? Math.floor(mergeProgress * 100) : percent}
+        percentage={stageProgress !== undefined ? Math.floor(stageProgress * 100) : percent}
         isDeterminate
         isPercentageTextHidden
         marginTop="0.5rem"
@@ -159,16 +183,28 @@ function DownloadRow({ snap, lang, onPause, onResume, onCancel, onRemove }: RowP
             {t('panel.mergeProgress', { percent: Math.floor(mergeProgress * 100) })}
           </Text>
         ) : null}
+        {isExporting && exportProgress !== undefined ? (
+          <Text data-testid="export-progress">
+            {t('panel.exportProgress', { percent: Math.floor(exportProgress * 100) })}
+          </Text>
+        ) : null}
         {record.status === 'verifying' && verifyProgress !== undefined ? (
           <Text>{Math.floor(verifyProgress * 100)}%</Text>
         ) : null}
         {isRunning ? <Text>{t('panel.expiresAt', { time: formatTime(record.expiresAt, lang) })}</Text> : null}
       </Flex>
-      {isRunning || isMerging || isPaused ? (
+      {isRunning || isMerging || isExporting || isPaused ? (
         <Text fontSize="small" color="font.tertiary" marginTop="0.25rem">
-          {storage === 'opfs'
-            ? t('panel.diskHintOpfs', { size: formatBytes(record.size) })
-            : t('panel.diskHintDirect', { size: formatBytes(record.size * 2) })}
+          {delivery === 'export'
+            ? t('panel.diskHintExport', { size: formatBytes(record.size) })
+            : storage === 'opfs'
+              ? t('panel.diskHintOpfs', { size: formatBytes(record.size) })
+              : t('panel.diskHintDirect', { size: formatBytes(record.size * 2) })}
+        </Text>
+      ) : null}
+      {keepsParts ? (
+        <Text fontSize="small" color="font.tertiary" marginTop="0.25rem" data-testid="export-keep-hint">
+          {t('panel.exportKeepHint', { size: formatBytes(record.size) })}
         </Text>
       ) : null}
       {record.reason ? (
@@ -177,7 +213,7 @@ function DownloadRow({ snap, lang, onPause, onResume, onCancel, onRemove }: RowP
           color={record.status === 'failed' ? 'font.error' : 'font.warning'}
           marginTop="0.25rem"
         >
-          {t(`panel.reason.${record.reason}`)}
+          {reasonText}
           {record.reason === 'PERMISSION' ? ` ${t('panel.permissionNeeded')}` : ''}
           {record.message ? ` (${record.message})` : ''}
         </Text>
@@ -196,6 +232,11 @@ function DownloadRow({ snap, lang, onPause, onResume, onCancel, onRemove }: RowP
         {record.status === 'failed' ? (
           <Button size="small" variation="primary" onClick={onResume}>
             {t('panel.retry')}
+          </Button>
+        ) : null}
+        {keepsParts ? (
+          <Button size="small" onClick={onExportAgain} data-testid="export-again">
+            {t('panel.exportAgain')}
           </Button>
         ) : null}
         {!isFinal ? (

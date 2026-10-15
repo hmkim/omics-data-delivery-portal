@@ -11,7 +11,7 @@ import { toast } from '../ui/notify';
 import { openCommandDialog } from './commandDialogStore';
 import { splitEngine } from './engine';
 import { decide, type DecideOptions } from './planner';
-import type { SplitEngine } from './splitEngine';
+import { SplitUnavailableError, type SplitEngine } from './splitEngine';
 
 /** Plain anchor download (mode `single`): the browser saves the signed URL to its download folder. */
 export function triggerAnchorDownload(url: string, filename: string, doc: Document = document): void {
@@ -38,6 +38,10 @@ export interface HandlerDeps {
 /**
  * Replacement for Storage Browser's default `download` action (design §5.2, D3-A):
  * POST /downloads (counts the event, decides S3 vs CloudFront) → planner → single | split | command.
+ *
+ * `split` may still be refused by the engine (`SplitUnavailableError`: `export` delivery without a usable OPFS, or
+ * no capability after all); the download then takes the `none` column of the §5.4 matrix — ordinary download below
+ * the single-object limit (R5.9 hint), the command dialog above it (R5.6) — and a toast says why.
  */
 /** Same shape as the library's `DownloadHandler`: `(input: DownloadHandlerInput) => DownloadHandlerOutput`. */
 export type PortalDownloadHandler = ActionHandler<
@@ -71,17 +75,14 @@ export function createPortalDownloadHandler(deps: HandlerDeps): PortalDownloadHa
         return { status: 'FAILED' as const, error: err instanceof Error ? err : new Error(message), message };
       }
 
-      const mode = decide({ sizeBytes: issued.sizeBytes }, deps.plannerOptions);
+      let mode = decide({ sizeBytes: issued.sizeBytes }, deps.plannerOptions);
       notify(t(issued.path === 'CF' ? 'toast.viaCloudFront' : 'toast.viaS3'), 'info');
-      const splitThreshold =
-        deps.plannerOptions?.settings?.splitThresholdBytes ?? getConfig().splitThresholdBytes;
-      if (mode === 'single' && issued.sizeBytes > splitThreshold) {
-        notify(t('toast.noResumeInThisBrowser'), 'warning', 12_000); // R5.9
-      }
+      const settings = deps.plannerOptions?.settings ?? {
+        splitThresholdBytes: getConfig().splitThresholdBytes,
+        singleObjectLimitBytes: getConfig().singleObjectLimitBytes,
+      };
 
-      if (mode === 'single') {
-        anchor(issued.url, issued.filename);
-      } else if (mode === 'split') {
+      if (mode === 'split') {
         try {
           await deps.engine.start(issued, bucket, key);
         } catch (err) {
@@ -90,9 +91,22 @@ export function createPortalDownloadHandler(deps: HandlerDeps): PortalDownloadHa
             notify(t('toast.savePickerCancelled'), 'warning');
             return { status: 'CANCELED' as const, message: t('toast.savePickerCancelled') };
           }
-          throw err;
+          if (err instanceof SplitUnavailableError) {
+            // D8: this browser cannot hold the parts → the `none` behaviour for this size
+            mode = decide({ sizeBytes: issued.sizeBytes }, { capability: 'none', settings });
+            notify(t(`toast.splitUnavailable.${err.reason}`), 'warning', 15_000);
+          } else {
+            throw err;
+          }
         }
-      } else {
+      }
+      if (mode === 'single' && issued.sizeBytes > settings.splitThresholdBytes) {
+        notify(t('toast.noResumeInThisBrowser'), 'warning', 12_000); // R5.9
+      }
+
+      if (mode === 'single') {
+        anchor(issued.url, issued.filename);
+      } else if (mode === 'command') {
         openCommand({ issued, bucket, key });
       }
       return { status: 'COMPLETE' as const, value: { url: new URL(issued.url) } };

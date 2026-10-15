@@ -33,5 +33,7 @@ interface Window {
    */
   __portalTest?: {
     pickFile?(suggestedName: string): Promise<FileSystemFileHandle>;
+    /** force the export delivery path (design §5.4 D8); the real choice is transferable-stream support */
+    forceExport?: 'stream' | 'blob';
   };
 }

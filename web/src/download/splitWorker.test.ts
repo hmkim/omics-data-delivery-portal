@@ -245,6 +245,15 @@ describe('splitWorker.transferPart — OPFS sink (T7.2, plan A)', () => {
   it('isQuotaError recognises QuotaExceededError and quota-worded errors only', () => {
     expect(isQuotaError(new DOMException('x', 'QuotaExceededError'))).toBe(true);
     expect(isQuotaError(new Error('The quota has been exceeded.'))).toBe(true);
+    // Firefox: XPCOM exception object from truncate(), not a DOMException and no "quota" in the text
+    expect(
+      isQuotaError({
+        name: 'NS_ERROR_FILE_NO_DEVICE_SPACE',
+        message: '',
+        toString: () =>
+          '[Exception... "File error: No device space"  nsresult: "0x80520010 (NS_ERROR_FILE_NO_DEVICE_SPACE)"]',
+      }),
+    ).toBe(true);
     expect(isQuotaError(new DOMException('x', 'NotFoundError'))).toBe(false);
     expect(isQuotaError(new TypeError('network error'))).toBe(false);
   });

@@ -11,13 +11,50 @@ import {
 } from '../helpers/portal';
 
 /**
- * T7.5 — Firefox has no File System Access API (design §5.4): 12 GiB is an ordinary download with the R5.9 toast and
- * no row badge; 53 GiB (> 50 GB single-object limit) opens the aria2c/curl command dialog with the "명령어 다운로드" badge.
+ * T7.5 — Firefox has no File System Access API (design §5.4). Since D8 it still splits (OPFS parts + export
+ * delivery, see export.spec.ts), so the row badges read "분할·이어받기" for 12 GiB and 53 GiB alike. The legacy
+ * behaviour — 12 GiB as an ordinary download with the R5.9 toast, 53 GiB (> 50 GB single-object limit) through the
+ * aria2c/curl command dialog with the "명령어 다운로드" badge — remains for browsers WITHOUT OPFS and is exercised here
+ * with `navigator.storage.getDirectory` removed before the SPA loads (Firefox ≤ 110, storage disabled).
  */
+
+/** Firefox without OPFS (capability `none`): the pre-D8 fallback column of the §5.4 matrix. */
+async function disableOpfs(page: Parameters<typeof signIn>[0]) {
+  await page.addInitScript(() => {
+    const storage = navigator.storage as StorageManager & { getDirectory?: unknown };
+    Object.defineProperty(storage, 'getDirectory', { value: undefined, configurable: true });
+  });
+}
+
 test.describe('T7.5 Firefox (R5.6, R5.9, R3.5, scenarios 4·10)', () => {
   test.skip(({ browserName }) => browserName !== 'firefox', 'Firefox-only scenario');
 
-  test('12 GiB → ordinary download + R5.9 toast + empty 방식 badge', async ({ page, creds }) => {
+  test('with OPFS (default): 12 GiB and 53 GiB rows carry the split badge (D8), no command dialog', async ({
+    page,
+    creds,
+  }) => {
+    await signIn(page, creds);
+    await openLocation(page, DEV.locations.demo);
+    const row12 = fileRow(page, OBJECTS.gib12.name);
+    await waitForRowStatus(row12);
+    expect(await methodBadge(row12)).toBe('분할·이어받기');
+    const row53 = fileRow(page, OBJECTS.gib53.name);
+    await waitForRowStatus(row53);
+    expect(await methodBadge(row53)).toBe('분할·이어받기');
+    expect(
+      await page.evaluate(
+        () =>
+          typeof navigator.storage.getDirectory === 'function' &&
+          typeof window.showSaveFilePicker === 'undefined',
+      ),
+    ).toBe(true);
+  });
+
+  test('without OPFS: 12 GiB → ordinary download + R5.9 toast + empty 방식 badge', async ({
+    page,
+    creds,
+  }) => {
+    await disableOpfs(page);
     await signIn(page, creds);
     await openLocation(page, DEV.locations.demo);
     const row = fileRow(page, OBJECTS.gib12.name);
@@ -36,10 +73,11 @@ test.describe('T7.5 Firefox (R5.6, R5.9, R3.5, scenarios 4·10)', () => {
     metric('firefox 12GiB path', issued.path);
   });
 
-  test('53 GiB → command dialog with valid aria2c / curl strings, copy works, 명령어 다운로드 badge', async ({
+  test('without OPFS: 53 GiB → command dialog with valid aria2c / curl strings, copy works, 명령어 다운로드 badge', async ({
     page,
     creds,
   }) => {
+    await disableOpfs(page);
     await signIn(page, creds);
     await openLocation(page, DEV.locations.demo);
     const row = fileRow(page, OBJECTS.gib53.name);

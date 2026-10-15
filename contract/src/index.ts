@@ -374,16 +374,19 @@ export function modeHintForSize(sizeBytes: number, splitThresholdBytes: number):
 /**
  * Client planner (design §5.4 matrix).
  *   size <= split threshold                      -> single
- *   split threshold < size <= single-object limit -> split (FS Access) | single (no FS Access, R5.9 hint)
- *   size > single-object limit                    -> split (FS Access) | command
+ *   split threshold < size <= single-object limit -> split (can split) | single (cannot, R5.9 hint)
+ *   size > single-object limit                    -> split (can split) | command
+ *
+ * `canSplit` is the browser's split capability (design §5.4, D8): File System Access API (`picker`) OR an
+ * origin-private file system with sync access handles (`export`). Browsers with neither take the right column.
  */
 export function planClientMode(
   sizeBytes: number,
-  hasFileSystemAccess: boolean,
+  canSplit: boolean,
   settings: Pick<RuntimeSettings, 'splitThresholdBytes' | 'singleObjectLimitBytes'>,
 ): ClientMode {
   if (sizeBytes <= settings.splitThresholdBytes) return 'single';
-  if (hasFileSystemAccess) return 'split';
+  if (canSplit) return 'split';
   return sizeBytes > settings.singleObjectLimitBytes ? 'command' : 'single';
 }
 

@@ -81,7 +81,8 @@ export async function openZipView(page: Page): Promise<void> {
 // split download panel
 // ---------------------------------------------------------------------------
 
-export type SplitStatus = 'running' | 'paused' | 'verifying' | 'complete' | 'failed';
+export type SplitStatus =
+  'running' | 'merging' | 'paused' | 'verifying' | 'exporting' | 'complete' | 'failed';
 
 export function splitRow(page: Page, fileName: string): Locator {
   return page.getByTestId('split-download').filter({ hasText: fileName });

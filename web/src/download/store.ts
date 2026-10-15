@@ -6,16 +6,34 @@ import type { StorageMode } from './partStorage';
  * Persistent state of split downloads (R5.4). Stored in IndexedDB so a closed tab or a re-login can
  * resume from `parts[].receivedBytes`; the `FileSystemFileHandle` is structured-cloneable and survives too.
  *
- * `merging` (storage `opfs` only): every part is complete and is being streamed into the destination file.
+ * `merging` (storage `opfs`, delivery `picker`): every part is complete and is being streamed into the destination
+ * file. `exporting` (delivery `export`): the verified parts are being handed to the browser's download manager.
  */
-export type SplitStatus = 'running' | 'merging' | 'paused' | 'verifying' | 'complete' | 'failed';
+export type SplitStatus =
+  'running' | 'merging' | 'paused' | 'verifying' | 'exporting' | 'complete' | 'failed';
+
+/**
+ * How the finished bytes reach the user (design §5.4, D8). `picker`: a destination file chosen with
+ * `showSaveFilePicker` (merge). `export`: no File System Access API — the OPFS parts are verified and then given to
+ * the browser as an ordinary download (service-worker stream, or a Blob URL where streams are not transferable).
+ */
+export type SplitDelivery = 'picker' | 'export';
 
 /**
  * Why a download is paused. `INTERRUPTED`: the tab/browser went away while it was running (found at `load()`).
- * `STORAGE_QUOTA`: the OPFS part write hit the origin's quota; resuming migrates the download to `direct` storage.
+ * `STORAGE_QUOTA`: the OPFS part write hit the origin's quota; resuming migrates a `picker` download to `direct`
+ * storage, an `export` download retries in OPFS. `EXPORT_FAILED`: the hand-over to the browser's download failed or
+ * was cancelled from the browser's download UI; resuming only repeats the export (the parts are intact).
  */
 export type SplitPauseReason =
-  'USER' | 'AUTH_EXPIRED' | 'PERMISSION' | 'NETWORK' | 'FILE_ERROR' | 'INTERRUPTED' | 'STORAGE_QUOTA';
+  | 'USER'
+  | 'AUTH_EXPIRED'
+  | 'PERMISSION'
+  | 'NETWORK'
+  | 'FILE_ERROR'
+  | 'INTERRUPTED'
+  | 'STORAGE_QUOTA'
+  | 'EXPORT_FAILED';
 export type SplitFailReason = 'CHECKSUM_MISMATCH' | 'FILE_ERROR' | 'NETWORK' | 'CANCELLED';
 export type SplitReason = SplitPauseReason | SplitFailReason;
 
@@ -51,11 +69,25 @@ export interface SplitRecord {
   expiresAt: string;
   checksumCrc32?: string;
   parts: SplitPartState[];
-  fileHandle: FileSystemFileHandle;
+  /** Destination chosen with the save picker. Absent for `delivery: 'export'`. */
+  fileHandle?: FileSystemFileHandle;
   /** Where in-flight bytes live (design §5.4). Records from before this field existed are `direct`. */
   storage?: StorageMode;
-  /** The destination file holds every byte (merge / final close succeeded); only verification is left. */
+  /** Records from before this field existed are `picker`. */
+  delivery?: SplitDelivery;
+  /** `picker`: the destination file holds every byte (merge / final close succeeded); only verification is left. */
   merged?: boolean;
+  /** `export`: the parts passed the CRC32 check; resuming goes straight to the export. */
+  verified?: boolean;
+  /** `export`: the CRC32 (base64) computed over the parts when `verified` was set. */
+  verifiedCrc32?: string;
+  /** `export`: how the browser received the file; set when the export completed. */
+  exportMode?: 'stream' | 'blob';
+  /**
+   * `export` + `blob`: when the Blob was handed to the browser. The engine cannot see the browser finish writing it,
+   * so the part files are kept until the entry is removed or `EXPORT_RETENTION_MS` has passed.
+   */
+  exportedAt?: number;
   status: SplitStatus;
   reason?: SplitReason;
   /** optional message attached to the last failure */

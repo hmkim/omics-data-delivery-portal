@@ -3,6 +3,7 @@ import { session } from '../auth/session';
 import { i18next } from '../i18n';
 import { formatBytes } from '../ui/format';
 import { toast } from '../ui/notify';
+import { createBrowserExportDelivery, registerExportServiceWorker } from './exportDelivery';
 import {
   createWorkerCapacityProbe,
   createWorkerPartRunner,
@@ -10,7 +11,7 @@ import {
   type SplitEngineEvent,
 } from './splitEngine';
 import { opfsPartStorage } from './partStorage';
-import { pickSaveFile } from './planner';
+import { pickSaveFile, splitCapability } from './planner';
 import { idbSplitStore } from './store';
 
 function announce(event: SplitEngineEvent): void {
@@ -37,6 +38,9 @@ function announce(event: SplitEngineEvent): void {
     case 'merging':
       toast(t('toast.merging', { filename: event.record.filename }), 'info');
       break;
+    case 'exporting':
+      toast(t('toast.exporting', { filename: event.record.filename }), 'info', 10_000);
+      break;
     case 'renewed':
       toast(t('toast.renewed'), 'info', 3000);
       break;
@@ -48,7 +52,9 @@ function announce(event: SplitEngineEvent): void {
       if (event.checksum.status === 'unverifiable')
         toast(t('toast.checksumUnverifiable', { filename }), 'warning', 10_000);
       else toast(t('toast.checksumOk', { filename }), 'success');
-      toast(t('toast.downloadComplete', { filename }), 'success');
+      // a Blob export is "complete" for the engine while the browser is still writing its copy
+      if (event.record.exportMode === 'blob') toast(t('toast.exportHanded', { filename }), 'info', 15_000);
+      else toast(t('toast.downloadComplete', { filename }), 'success');
       break;
     }
     case 'failed':
@@ -70,5 +76,14 @@ export const splitEngine = new SplitEngine({
   session,
   // OPFS part files; the storage choice reserves the file size in a worker (exact), not via the capped estimate
   partStorage: { ...opfsPartStorage, canHold: createWorkerCapacityProbe() },
+  // D8: picker (Chrome/Edge) → merge into the chosen file; export (Firefox/Safari/Brave) → browser download
+  capability: splitCapability,
+  deliver: createBrowserExportDelivery(),
   onEvent: announce,
 });
+
+// The export service worker streams verified parts to the browser's download manager (design §5.4 D8). Registered
+// at start-up so it is active by the time a download finishes; without it the Blob path is used.
+if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+  void registerExportServiceWorker(navigator.serviceWorker);
+}

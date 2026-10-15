@@ -105,11 +105,24 @@ failures under `<output>/test-results/`. Measured numbers are printed as `[e2e-m
 - **T7.4 auth expiry** — after `AdminUserGlobalSignOut` the clock jumps 65 min so the renew forces a token refresh
   → `paused / AUTH_EXPIRED` in IndexedDB (not `failed`), banner `세션이 끝났습니다…`, sign-in form; re-login shows the
   row with `재개` and the AUTH_EXPIRED reason; resume → complete → CRC32.
-- **T7.5 Firefox** — 12 GiB: empty badge, R5.9 toast, `download` event (cancelled); 53 GiB: badge `명령어 다운로드`,
-  dialog with exactly `aria2c -x 4 -s 4 -k 8G --file-allocation=none -o "sample-53gib.bin" "<url>"` and
+- **T7.5 Firefox** — with OPFS (default since D8): 12 GiB and 53 GiB rows carry the badge `분할·이어받기`, no command
+  dialog. With OPFS disabled by an init script (the pre-D8 / Firefox ≤ 110 behaviour): 12 GiB → empty badge, R5.9
+  toast, `download` event (cancelled); 53 GiB → badge `명령어 다운로드`, dialog with exactly
+  `aria2c -x 4 -s 4 -k 8G --file-allocation=none -o "sample-53gib.bin" "<url>"` and
   `curl -L -C - -o "sample-53gib.bin" "<url>"`, URL https / path `/projects/DEMO-0001/sample-53gib.bin` / signed query,
   host `*.cloudfront.net` (CF) or the bucket's S3 host; copy button → `복사됨`, clipboard read back (Firefox prefs
   `dom.events.testing.asyncClipboard` in the config).
+- **T7.8 export delivery (D8, `export.spec.ts`)** — split downloads in browsers without the File System Access API.
+  Firefox, `sample-2gib.bin` (one part): badge `분할·이어받기`, panel `data-delivery=export` / `data-storage=opfs`,
+  pause at 5 % (OPFS part size == persisted progress), resume, reload at +10 pp → `paused / INTERRUPTED` with the
+  same byte count, resume → `verifying` → `exporting` → Playwright `download` event → the file the **browser** saved
+  is 2,147,483,648 B with CRC32 `9SRMCg==` (Node zlib), parts deleted. Chromium with `showSaveFilePicker` removed and
+  the Blob path forced (Brave / Safari ≤ 26 stand-in), `sample-12gib.bin` (two parts): same flow without the reload,
+  saved file CRC32 `/sXQ3A==`, parts **kept** after `complete` and deleted by `목록에서 제거`. The Firefox test uses
+  2 GiB on purpose: Playwright's Firefox keeps every in-flight response body in the browser parent process, so a
+  12 GiB run exhausts host memory (see the spec header). The Firefox config sets `dom.storageManager.prompt.testing*`
+  so `navigator.storage.persist()` is answered — without persistence Firefox caps OPFS at 10 GiB and the engine falls
+  back with the `OPFS_QUOTA` toast.
 - **T7.6 cache** — up to three UI downloads of `E2E_BIG_FILE` until two `path: CF` passes are complete (cf-threshold is
   1, so at most the first is S3); each pass CRC32-checked, panel entry removed and OPFS file deleted between passes;
   windows written to `cache-passes.json`. The Athena test (gated) queries
@@ -169,6 +182,12 @@ aws s3api head-object --bucket genome-portal-data-123456789012-ap-northeast-2 \
 #   → ChecksumCRC32 must be 44SoTA== with ChecksumType FULL_OBJECT. copy-object of a multipart-uploaded source may
 #     not carry a full-object checksum; then re-upload with `npx tsx tools/upload.ts` (`tools/upload.ts`, verifies FULL_OBJECT CRC32) instead.
 npx playwright test cache-zip --project=chromium --grep "two 1 GiB"
+
+# T7.8 export delivery — create the 2 GiB object once (same keystream scheme as the other seeds, FULL_OBJECT CRC32
+#   9SRMCg==), then run the two export tests. ~2 GiB + ~12 GiB of transfer, ≈ $1.5 on the CloudFront path.
+tools/seed.sh --bucket genome-portal-data-123456789012-ap-northeast-2 --sizes 2 --skip-admin --work-dir "$TMPDIR"
+npx playwright test export.spec --project=firefox --grep "Firefox: 2 GiB"
+npx playwright test export.spec --project=chromium --grep "Chromium without File System Access"
 ```
 
 ## Cost and duration notes

@@ -1,7 +1,14 @@
 import { SINGLE_OBJECT_LIMIT_BYTES, SPLIT_THRESHOLD_BYTES } from '@genome-portal/contract';
 import { describe, expect, it, vi } from 'vitest';
 import { buildCommands, shellQuote } from './commandFallback';
-import { decide, hasFileSystemAccess, pickSaveFile, settingsFromConfig } from './planner';
+import {
+  capabilityFrom,
+  decide,
+  hasFileSystemAccess,
+  pickSaveFile,
+  settingsFromConfig,
+  splitCapability,
+} from './planner';
 
 const GiB = 1024 ** 3;
 const settings = {
@@ -50,6 +57,46 @@ describe('download/planner (T3.6) — §5.4 matrix', () => {
       hasFileSystemAccess({ showSaveFilePicker: async () => ({}) as FileSystemFileHandle } as Window),
     ).toBe(true);
     expect(hasFileSystemAccess(undefined)).toBe(false);
+  });
+
+  it('export capability (D8): split above 1 GiB and above 50 GB, no command fallback', () => {
+    const exp = { capability: 'export' as const, settings };
+    expect(decide({ sizeBytes: GiB }, exp)).toBe('single');
+    expect(decide({ sizeBytes: 12 * GiB }, exp)).toBe('split');
+    expect(decide({ sizeBytes: 53 * GiB }, exp)).toBe('split'); // parts ≤ 8 GiB each, the 50 GB limit is per GET
+    expect(decide({ sizeBytes: 53 * GiB }, { capability: 'none', settings })).toBe('command');
+  });
+
+  it('capabilityFrom(): explicit capability wins, the legacy boolean maps to picker / none', () => {
+    expect(capabilityFrom({ capability: 'export', hasFileSystemAccess: true })).toBe('export');
+    expect(capabilityFrom({ hasFileSystemAccess: true })).toBe('picker');
+    expect(capabilityFrom({ hasFileSystemAccess: false })).toBe('none');
+  });
+});
+
+describe('download/planner — splitCapability() feature detection (D8)', () => {
+  const picker = { showSaveFilePicker: async () => ({}) as FileSystemFileHandle } as Window;
+  const opfs = { storage: { getDirectory: async () => ({}) as FileSystemDirectoryHandle } };
+
+  it('Chrome / Edge: showSaveFilePicker → picker (even with OPFS present)', () => {
+    expect(splitCapability({ window: picker, navigator: opfs, hasWorker: true })).toBe('picker');
+  });
+
+  it('Firefox 111+ / Safari 17+ / Brave: no picker, OPFS + workers → export', () => {
+    expect(splitCapability({ window: {} as Window, navigator: opfs, hasWorker: true })).toBe('export');
+  });
+
+  it('no OPFS (Firefox ≤ 110, Safari ≤ 15.1, storage disabled) or no workers → none', () => {
+    expect(splitCapability({ window: {} as Window, navigator: {}, hasWorker: true })).toBe('none');
+    expect(splitCapability({ window: {} as Window, navigator: { storage: {} }, hasWorker: true })).toBe(
+      'none',
+    );
+    expect(splitCapability({ window: {} as Window, navigator: opfs, hasWorker: false })).toBe('none');
+    expect(splitCapability({ window: undefined, navigator: undefined })).toBe('none');
+  });
+
+  it('jsdom (this test runtime) has neither API → none', () => {
+    expect(splitCapability()).toBe('none');
   });
 });
 

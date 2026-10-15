@@ -159,3 +159,27 @@ export function opfsPartSizes(page: Page, downloadId: string): Promise<number[] 
     return sizes.sort(([a], [b]) => a.localeCompare(b)).map(([, size]) => size);
   }, downloadId);
 }
+
+/**
+ * CRC32 (S3 base64 encoding) of a file on the test runner's disk, computed with Node's native `zlib.crc32` in
+ * 64 MiB slices (~1 GB/s). Used on files the browser saved through its own download manager (D8 export delivery).
+ */
+export async function fileCrc32(path: string): Promise<Crc32Result> {
+  const { createReadStream } = await import('node:fs');
+  const { crc32 } = await import('node:zlib');
+  const started = performance.now();
+  let crc = 0;
+  let bytes = 0;
+  for await (const chunk of createReadStream(path, { highWaterMark: 64 * 1024 * 1024 })) {
+    const buf = chunk as Buffer;
+    crc = crc32(buf, crc);
+    bytes += buf.byteLength;
+  }
+  const digest = String.fromCharCode(
+    (crc >>> 24) & 0xff,
+    (crc >>> 16) & 0xff,
+    (crc >>> 8) & 0xff,
+    crc & 0xff,
+  );
+  return { base64: btoa(digest), bytes, elapsedMs: performance.now() - started };
+}

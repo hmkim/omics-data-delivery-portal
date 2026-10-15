@@ -37,6 +37,18 @@ export const OBJECTS = {
     sizeBytes: GiB,
     crc32: '44SoTA==',
   },
+  /**
+   * Smallest split object above the 1 GiB threshold that still takes long enough to pause/reload mid-transfer
+   * (single part, PART_SIZE_BYTES = 8 GiB). Used by the Firefox export e2e: Playwright's Firefox (Juggler
+   * NetworkObserver) keeps every in-flight response body in the browser parent process until the request ends,
+   * so a 12 GiB run holds >10 GB and stalls the host; 2 GiB exercises the same code path at a fraction of that.
+   */
+  gib2: {
+    name: 'sample-2gib.bin',
+    key: 'projects/DEMO-0001/sample-2gib.bin',
+    sizeBytes: 2 * GiB,
+    crc32: '9SRMCg==',
+  },
   gib12: {
     name: 'sample-12gib.bin',
     key: 'projects/DEMO-0001/sample-12gib.bin',

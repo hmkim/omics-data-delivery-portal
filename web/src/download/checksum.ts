@@ -20,12 +20,17 @@ export function crc32ToBase64(digest: Uint8Array): string {
 export async function crc32Base64FromStream(
   stream: ReadableStream<Uint8Array>,
   onProgress?: (bytesRead: number) => void,
+  signal?: AbortSignal,
 ): Promise<string> {
   const hasher = await createCRC32();
   hasher.init();
   const reader = stream.getReader();
   let read = 0;
   for (;;) {
+    if (signal?.aborted) {
+      await reader.cancel().catch(() => undefined);
+      throw new DOMException('checksum aborted', 'AbortError');
+    }
     const { done, value } = await reader.read();
     if (done) break;
     hasher.update(value);

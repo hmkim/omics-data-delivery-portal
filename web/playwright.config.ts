@@ -71,6 +71,9 @@ if (process.env.E2E_SKIP_FIREFOX !== '1') {
         firefoxUserPrefs: {
           'dom.events.testing.asyncClipboard': true,
           'dom.events.asyncClipboard.readText': true,
+          // navigator.storage.persist() shows a doorhanger in Firefox; answer it for the split engine (D8)
+          'dom.storageManager.prompt.testing': true,
+          'dom.storageManager.prompt.testing.allow': true,
         },
       },
     },

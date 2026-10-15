@@ -6,7 +6,13 @@ import {
   type RenewResponse,
 } from '@genome-portal/contract';
 import { AuthExpiredError } from '../api/client';
-import { verifyFile, type ChecksumOutcome } from './checksum';
+import { compareChecksum, crc32Base64FromStream, verifyFile, type ChecksumOutcome } from './checksum';
+import {
+  concatParts,
+  createBrowserExportDelivery,
+  type ExportDelivery,
+  type ExportOutcome,
+} from './exportDelivery';
 import {
   chooseStorage,
   opfsPartStorage,
@@ -14,7 +20,9 @@ import {
   type StorageChoice,
   type StorageMode,
 } from './partStorage';
+import { splitCapability, type SplitCapability } from './planner';
 import {
+  type SplitDelivery,
   type SplitPartState,
   type SplitPauseReason,
   type SplitReason,
@@ -146,11 +154,23 @@ export interface SplitEngineDeps {
   store: SplitStore;
   renew: (downloadId: string) => Promise<RenewResponse>;
   runPart: PartRunner;
+  /** `picker` delivery: choose the destination file */
   pickFile: (suggestedName: string) => Promise<FileSystemFileHandle>;
   session: { incrementActiveDownloads(): void; decrementActiveDownloads(): void };
   /** where in-flight bytes live; default: the origin-private file system */
   partStorage?: PartStorage;
   verify?: (file: Blob, expected: string | undefined) => Promise<ChecksumOutcome>;
+  /** `export` delivery: CRC32 of the concatenated part stream; default hash-wasm */
+  verifyStream?: (
+    stream: ReadableStream<Uint8Array>,
+    expected: string | undefined,
+    onProgress: (bytesRead: number) => void,
+    signal: AbortSignal,
+  ) => Promise<ChecksumOutcome>;
+  /** `export` delivery: hand the verified parts to the browser's download manager; default: SW stream | Blob */
+  deliver?: ExportDelivery;
+  /** browser capability (design §5.4 D8); default: feature detection */
+  capability?: () => SplitCapability;
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
@@ -170,6 +190,8 @@ export type SplitEngineEvent =
   | { type: 'migrated'; record: SplitRecord }
   | { type: 'renewed'; record: SplitRecord }
   | { type: 'merging'; record: SplitRecord }
+  /** `export`: the parts passed the checksum and are being handed to the browser's download */
+  | { type: 'exporting'; record: SplitRecord }
   | { type: 'paused'; record: SplitRecord; reason: SplitPauseReason }
   | { type: 'complete'; record: SplitRecord; checksum: ChecksumOutcome }
   | { type: 'failed'; record: SplitRecord; reason: SplitReason; message?: string }
@@ -185,9 +207,31 @@ export interface SplitSnapshot {
   etaSeconds?: number;
   /** merge progress 0..1 while `merging` */
   mergeProgress?: number;
+  /** export progress 0..1 while `exporting` (stream path; the Blob path has no progress) */
+  exportProgress?: number;
   /** checksum verification progress 0..1 */
   verifyProgress?: number;
 }
+
+/**
+ * `start()` could not run a split download in this browser: no capability at all, or `export` delivery without a
+ * usable OPFS (missing, or the quota cannot hold the file). The handler falls back to the ordinary download / the
+ * command dialog (R5.6, R5.9) and tells the user why.
+ */
+export class SplitUnavailableError extends Error {
+  constructor(
+    readonly reason: 'NO_CAPABILITY' | 'OPFS_UNAVAILABLE' | 'OPFS_QUOTA',
+    readonly choice?: StorageChoice,
+  ) {
+    super(`split download unavailable: ${reason}`);
+    this.name = 'SplitUnavailableError';
+  }
+}
+
+/** `export` + Blob delivery: how long the part files stay after the hand-over before `load()` purges them. */
+export const EXPORT_RETENTION_MS = 24 * 60 * 60_000;
+/** Longest wait for the browser's persistent-storage answer before the storage choice proceeds without it. */
+export const PERSIST_WAIT_MS = 30_000;
 
 interface ActiveRun {
   record: SplitRecord;
@@ -198,7 +242,9 @@ interface ActiveRun {
   renewTimer?: unknown;
   renewing?: Promise<void>;
   samples: Array<{ t: number; bytes: number }>;
+  /** merge (picker) or export (stream) bytes handed over so far */
   mergedBytes: number;
+  /** aborts the merge, the part verification or the export in flight */
   mergeAbort?: AbortController;
   verifyProgress?: number;
   retries: Map<number, number>;
@@ -229,6 +275,10 @@ export function storageOf(record: Pick<SplitRecord, 'storage'>): StorageMode {
   return record.storage ?? 'direct';
 }
 
+export function deliveryOf(record: Pick<SplitRecord, 'delivery'>): SplitDelivery {
+  return record.delivery ?? 'picker';
+}
+
 /** Delay until the renew should fire: `expiresAt - RENEW_LEAD_MS - now`, never negative. */
 export function renewDelayMs(expiresAtIso: string, now: number): number {
   return Math.max(0, new Date(expiresAtIso).getTime() - RENEW_LEAD_MS - now);
@@ -238,10 +288,11 @@ export function buildRecord(
   issued: DownloadResponse,
   bucket: string,
   key: string,
-  fileHandle: FileSystemFileHandle,
+  fileHandle: FileSystemFileHandle | undefined,
   now: number,
   partSize = PART_SIZE_BYTES,
   storage: StorageMode = 'direct',
+  delivery: SplitDelivery = 'picker',
 ): SplitRecord {
   const { parts } = planParts(issued.sizeBytes, partSize);
   return {
@@ -262,8 +313,9 @@ export function buildRecord(
       receivedBytes: 0,
       committedBytes: 0,
     })),
-    fileHandle,
+    ...(fileHandle ? { fileHandle } : {}),
     storage,
+    delivery,
     status: 'paused',
     createdAt: now,
     updatedAt: now,
@@ -317,18 +369,47 @@ export class SplitEngine {
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
   private readonly clearTimer: (handle: unknown) => void;
   private readonly verify: (file: Blob, expected: string | undefined) => Promise<ChecksumOutcome>;
+  private readonly verifyStream: NonNullable<SplitEngineDeps['verifyStream']>;
   private readonly partStorage: PartStorage;
   private readonly partSize: number;
   private readonly maxPartRetries: number;
+  private readonly capability: () => SplitCapability;
+  private deliverImpl?: ExportDelivery;
+  /** Blob exports: object URLs to revoke when the entry goes away */
+  private readonly objectUrls = new Map<string, string>();
 
   constructor(private readonly deps: SplitEngineDeps) {
     this.now = deps.now ?? (() => Date.now());
     this.setTimer = deps.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
     this.clearTimer = deps.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
     this.verify = deps.verify ?? verifyFile;
+    this.verifyStream =
+      deps.verifyStream ??
+      (async (stream, expected, onProgress, signal) =>
+        compareChecksum(await crc32Base64FromStream(stream, onProgress, signal), expected));
     this.partStorage = deps.partStorage ?? opfsPartStorage;
     this.partSize = deps.partSize ?? PART_SIZE_BYTES;
     this.maxPartRetries = deps.maxPartRetries ?? 3;
+    this.capability = deps.capability ?? splitCapability;
+    this.deliverImpl = deps.deliver;
+  }
+
+  private get deliver(): ExportDelivery {
+    this.deliverImpl ??= createBrowserExportDelivery();
+    return this.deliverImpl;
+  }
+
+  /** `navigator.storage.persist()` with an upper bound on the wait (Firefox prompts the user). */
+  private async persistWithin(ms: number): Promise<boolean> {
+    let timer: unknown;
+    const timeout = new Promise<boolean>((resolve) => {
+      timer = this.setTimer(() => resolve(false), ms);
+    });
+    try {
+      return await Promise.race([Promise.resolve(this.partStorage.persist()).catch(() => false), timeout]);
+    } finally {
+      this.clearTimer(timer);
+    }
   }
 
   // ----- observation -----------------------------------------------------
@@ -348,21 +429,25 @@ export class SplitEngine {
     return record ? this.snapshotOf(record) : undefined;
   }
 
-  /** Number of downloads currently transferring or merging (paused ones do not count, §5.6). */
+  /** Number of downloads currently transferring, merging or exporting (paused ones do not count, §5.6). */
   get runningCount(): number {
     return [...this.runs.values()].filter(
-      (r) => r.record.status === 'running' || r.record.status === 'merging',
+      (r) =>
+        r.record.status === 'running' || r.record.status === 'merging' || r.record.status === 'exporting',
     ).length;
   }
 
   /**
-   * Load persisted records. One left `running` / `merging` / `verifying` was interrupted by a closed tab or a
-   * crashed browser: it becomes `paused / INTERRUPTED`. With `direct` storage nothing after the last `close()`
-   * reached the destination, so its progress rolls back to `committedBytes`; with `opfs` storage the persisted
-   * progress is already durable (and is checked against the part files when the download resumes).
+   * Load persisted records. One left `running` / `merging` / `verifying` / `exporting` was interrupted by a closed
+   * tab or a crashed browser: it becomes `paused / INTERRUPTED`. With `direct` storage nothing after the last
+   * `close()` reached the destination, so its progress rolls back to `committedBytes`; with `opfs` storage the
+   * persisted progress is already durable (and is checked against the part files when the download resumes). An
+   * `export` record keeps `verified`, so its resume only repeats the hand-over. Blob exports older than
+   * `EXPORT_RETENTION_MS` are purged together with their part files.
    */
   async load(): Promise<SplitRecord[]> {
     const stored = await this.deps.store.list();
+    const kept: SplitRecord[] = [];
     for (const rec of stored) {
       let dirty = false;
       if (rec.storage === undefined) {
@@ -375,57 +460,117 @@ export class SplitEngine {
           dirty = true;
         }
       }
-      if (rec.status === 'running' || rec.status === 'merging' || rec.status === 'verifying') {
+      if (
+        rec.status === 'running' ||
+        rec.status === 'merging' ||
+        rec.status === 'verifying' ||
+        rec.status === 'exporting'
+      ) {
         if (storageOf(rec) === 'direct' && !rec.merged) rollBackToCommitted(rec);
         rec.status = 'paused';
         rec.reason = 'INTERRUPTED';
         rec.message = undefined;
         dirty = true;
       }
+      if (
+        deliveryOf(rec) === 'export' &&
+        rec.status === 'complete' &&
+        rec.exportMode === 'blob' &&
+        rec.exportedAt !== undefined &&
+        this.now() - rec.exportedAt >= EXPORT_RETENTION_MS
+      ) {
+        await this.partStorage.deleteAll(rec.downloadId).catch(() => undefined);
+        await this.deps.store.delete(rec.downloadId);
+        continue;
+      }
       if (dirty) await this.deps.store.put(rec);
+      kept.push(rec);
     }
-    this.records = stored;
+    this.records = kept;
     this.loaded = true;
     this.emit();
-    return stored;
+    return kept;
   }
 
   // ----- commands ----------------------------------------------------------
 
-  /** New split download: choose the destination file and the storage, persist the plan, start transferring. */
+  /**
+   * New split download: decide the delivery from the browser capability (design §5.4 D8), choose the destination
+   * file (`picker`) and the storage, persist the plan, start transferring. Throws `SplitUnavailableError` when this
+   * browser cannot run a split download for this file (the handler falls back to the ordinary paths).
+   */
   async start(issued: DownloadResponse, bucket: string, key: string): Promise<SplitRecord> {
     if (!this.loaded) await this.load();
-    const fileHandle = await this.deps.pickFile(issued.filename);
+    const capability = this.capability();
+    if (capability === 'none') throw new SplitUnavailableError('NO_CAPABILITY');
+    const delivery: SplitDelivery = capability === 'picker' ? 'picker' : 'export';
+    const fileHandle = delivery === 'picker' ? await this.deps.pickFile(issued.filename) : undefined;
+    // Persistence BEFORE the quota probe: Firefox caps a best-effort origin at 10 GiB and lifts the cap only once
+    // the origin is persisted (dev probe 2026-10-14: 10 GiB → 268 GB). Chromium answers at once; Firefox shows a
+    // doorhanger and resolves when the user answers, so the wait is bounded — an ignored prompt means the probe
+    // runs against the small quota and the handler falls back with the OPFS_QUOTA toast.
+    if (this.partStorage.available()) await this.persistWithin(PERSIST_WAIT_MS);
     const choice = await chooseStorage(issued.downloadId, issued.sizeBytes, this.partStorage);
-    if (choice.mode === 'opfs') await this.partStorage.persist();
-    const record = buildRecord(issued, bucket, key, fileHandle, this.now(), this.partSize, choice.mode);
+    if (delivery === 'export' && choice.mode !== 'opfs') {
+      throw new SplitUnavailableError(choice.fallbackReason ?? 'OPFS_UNAVAILABLE', choice);
+    }
+    const record = buildRecord(
+      issued,
+      bucket,
+      key,
+      fileHandle,
+      this.now(),
+      this.partSize,
+      choice.mode,
+      delivery,
+    );
     await this.upsert(record);
     if (choice.mode === 'direct') this.deps.onEvent?.({ type: 'storage-fallback', record, choice });
     void this.run(record, false);
     return record;
   }
 
-  /** Resume a paused download (R5.4): re-request file permission, then continue from `receivedBytes`. */
+  /**
+   * Resume a paused download (R5.4): re-request file permission (`picker`), then continue from `receivedBytes`.
+   * An `export` record that is already `verified` only repeats the hand-over.
+   */
   async resume(downloadId: string): Promise<void> {
     const record = await this.getRecord(downloadId);
     if (!record || this.runs.has(downloadId)) return;
     if (record.status !== 'paused' && record.status !== 'failed') return;
-    const permission = await requestReadWrite(record.fileHandle);
-    if (permission !== 'granted') {
-      record.status = 'paused';
-      record.reason = 'PERMISSION';
-      await this.upsert(record);
-      return;
+    if (record.fileHandle) {
+      const permission = await requestReadWrite(record.fileHandle);
+      if (permission !== 'granted') {
+        record.status = 'paused';
+        record.reason = 'PERMISSION';
+        await this.upsert(record);
+        return;
+      }
     }
-    const migrate = record.reason === 'STORAGE_QUOTA' && storageOf(record) === 'opfs';
+    const migrate =
+      record.reason === 'STORAGE_QUOTA' && storageOf(record) === 'opfs' && deliveryOf(record) === 'picker';
     if (record.status === 'failed') {
       // "download again": every part is re-received from its start
       record.parts = record.parts.map((p) => ({ ...p, done: false, receivedBytes: 0, committedBytes: 0 }));
       record.merged = false;
+      record.verified = false;
+      record.verifiedCrc32 = undefined;
       if (storageOf(record) === 'opfs')
         await this.partStorage.deleteAll(record.downloadId).catch(() => undefined);
     }
     void this.run(record, true, migrate);
+  }
+
+  /**
+   * `export` + Blob delivery after `complete`: hand the kept parts to the browser once more (the user dismissed the
+   * save dialog, or the browser's download was cancelled). No-op unless the parts are still there.
+   */
+  async exportAgain(downloadId: string): Promise<void> {
+    const record = await this.getRecord(downloadId);
+    if (!record || this.runs.has(downloadId)) return;
+    if (deliveryOf(record) !== 'export' || record.status !== 'complete' || !record.verified) return;
+    this.revokeObjectUrl(downloadId);
+    void this.run(record, true);
   }
 
   async pause(downloadId: string, reason: SplitPauseReason = 'USER'): Promise<void> {
@@ -446,24 +591,40 @@ export class SplitEngine {
     const record = await this.getRecord(downloadId);
     if (record) {
       if (storageOf(record) === 'opfs') await this.partStorage.deleteAll(downloadId).catch(() => undefined);
-      await discardFile(record.fileHandle);
+      if (record.fileHandle) await discardFile(record.fileHandle);
       await this.deps.store.delete(downloadId);
     }
+    this.revokeObjectUrl(downloadId);
     this.records = this.records.filter((r) => r.downloadId !== downloadId);
     this.deps.onEvent?.({ type: 'cancelled', downloadId });
     this.emit();
   }
 
-  /** Remove a finished (complete / failed) entry from the list without touching the destination file. */
+  /**
+   * Remove a finished (complete / failed) entry from the list without touching the destination file. For a Blob
+   * export this is also what releases the kept part files (the browser has finished writing its copy by then).
+   */
   async remove(downloadId: string): Promise<void> {
     if (this.runs.has(downloadId)) return;
     const record = await this.getRecord(downloadId);
     if (record && storageOf(record) === 'opfs') {
       await this.partStorage.deleteAll(downloadId).catch(() => undefined);
     }
+    this.revokeObjectUrl(downloadId);
     await this.deps.store.delete(downloadId);
     this.records = this.records.filter((r) => r.downloadId !== downloadId);
     this.emit();
+  }
+
+  private revokeObjectUrl(downloadId: string): void {
+    const url = this.objectUrls.get(downloadId);
+    if (!url) return;
+    this.objectUrls.delete(downloadId);
+    try {
+      URL.revokeObjectURL(url);
+    } catch {
+      // not available in this environment
+    }
   }
 
   // ----- internals -----------------------------------------------------------
@@ -519,6 +680,10 @@ export class SplitEngine {
         run && record.status === 'merging' && record.size > 0
           ? Math.min(1, run.mergedBytes / record.size)
           : undefined,
+      exportProgress:
+        run && record.status === 'exporting' && record.size > 0
+          ? Math.min(1, run.mergedBytes / record.size)
+          : undefined,
       verifyProgress: run?.verifyProgress,
     };
   }
@@ -554,9 +719,17 @@ export class SplitEngine {
   private async execute(run: ActiveRun, resumed: boolean): Promise<void> {
     const { record } = run;
     const storage = storageOf(record);
+    const delivery = deliveryOf(record);
     record.reason = undefined;
     record.message = undefined;
-    record.status = record.merged ? 'verifying' : 'running';
+    record.status =
+      delivery === 'export'
+        ? record.verified
+          ? 'exporting'
+          : 'running'
+        : record.merged
+          ? 'verifying'
+          : 'running';
     await this.upsert(record);
     this.deps.session.incrementActiveDownloads();
     this.deps.onEvent?.({ type: 'started', record, resumed });
@@ -579,6 +752,11 @@ export class SplitEngine {
       else await this.markFailed(record, reason as SplitReason, message);
     };
 
+    if (delivery === 'export') {
+      await this.executeExport(run, finish, release);
+      return;
+    }
+
     if (!record.merged) {
       if (run.migrate && storage === 'opfs') {
         try {
@@ -600,7 +778,7 @@ export class SplitEngine {
           }
         } else {
           try {
-            run.writable = await record.fileHandle.createWritable({ keepExistingData: true });
+            run.writable = await this.destination(record).createWritable({ keepExistingData: true });
           } catch (err) {
             await finish('paused', permissionOrFileError(err), errorMessage(err));
             return;
@@ -669,7 +847,7 @@ export class SplitEngine {
 
     let outcome: ChecksumOutcome;
     try {
-      const file = await record.fileHandle.getFile();
+      const file = await this.destination(record).getFile();
       run.verifyProgress = 0;
       outcome = await this.verify(file, record.checksumCrc32);
     } catch (err) {
@@ -690,6 +868,225 @@ export class SplitEngine {
     record.reason = undefined;
     await this.upsert(record);
     this.deps.onEvent?.({ type: 'complete', record, checksum: outcome });
+  }
+
+  /** `picker` delivery: the destination file handle (always present for that delivery). */
+  private destination(record: SplitRecord): FileSystemFileHandle {
+    if (!record.fileHandle) throw new Error('split download has no destination file');
+    return record.fileHandle;
+  }
+
+  /**
+   * `export` delivery (design §5.4 D8): reconcile → transfer parts into OPFS → verify the concatenated parts →
+   * hand them to the browser's download. A part found missing at verify/export time is re-received (loop).
+   */
+  private async executeExport(
+    run: ActiveRun,
+    finish: (
+      outcome: 'paused' | 'failed' | 'cancelled',
+      reason?: SplitReason,
+      message?: string,
+    ) => Promise<void>,
+    release: () => void,
+  ): Promise<void> {
+    const { record } = run;
+    for (;;) {
+      if (!record.verified) {
+        try {
+          await this.reconcileOpfs(record);
+        } catch (err) {
+          await finish('paused', 'FILE_ERROR', errorMessage(err));
+          return;
+        }
+        if (record.status !== 'running') {
+          record.status = 'running';
+          await this.upsert(record);
+        }
+        run.samples = [{ t: this.now(), bytes: receivedBytesOf(record) }];
+        try {
+          if (renewDelayMs(record.expiresAt, this.now()) === 0) await this.renewNow(run);
+          this.scheduleRenew(run);
+          await this.transferParts(run);
+        } catch (err) {
+          if (err instanceof AuthExpiredError) run.stopRequested ??= 'AUTH_EXPIRED';
+          else if (!run.stopRequested) run.stopRequested = 'NETWORK';
+          if (!record.message && err instanceof Error) record.message = err.message;
+        }
+        this.clearRenew(run);
+        await this.abortAll(run);
+        if (run.stopRequested) {
+          await this.settleStopped(run, finish);
+          return;
+        }
+
+        record.status = 'verifying';
+        await this.upsert(record);
+        const verdict = await this.verifyParts(run);
+        if (run.stopRequested) {
+          await this.settleStopped(run, finish);
+          return;
+        }
+        if (verdict.kind === 'parts-missing') continue;
+        if (verdict.kind === 'error') {
+          await finish('paused', 'FILE_ERROR', verdict.message);
+          return;
+        }
+        if (verdict.outcome.status === 'mismatch') {
+          this.runs.delete(record.downloadId);
+          release();
+          await this.markFailed(
+            record,
+            'CHECKSUM_MISMATCH',
+            `expected ${verdict.outcome.expected}, got ${verdict.outcome.actual}`,
+          );
+          return;
+        }
+        record.verified = true;
+        record.verifiedCrc32 = verdict.outcome.actual;
+        await this.upsert(record);
+      }
+
+      // hand-over
+      let parts: Blob[];
+      try {
+        parts = await this.collectParts(record);
+      } catch (err) {
+        if (err instanceof PartMissingError) {
+          await this.forgetPart(record, err);
+          continue; // re-receive, re-verify
+        }
+        await finish('paused', 'FILE_ERROR', errorMessage(err));
+        return;
+      }
+      record.status = 'exporting';
+      run.mergedBytes = 0;
+      await this.upsert(record);
+      this.deps.onEvent?.({ type: 'exporting', record });
+      const abort = new AbortController();
+      run.mergeAbort = abort;
+      let outcome: ExportOutcome;
+      let sinceEmit = 0;
+      try {
+        outcome = await this.deliver({
+          downloadId: record.downloadId,
+          filename: record.filename,
+          size: record.size,
+          parts,
+          signal: abort.signal,
+          onProgress: (bytes) => {
+            sinceEmit += bytes - run.mergedBytes;
+            run.mergedBytes = bytes;
+            if (sinceEmit >= MERGE_EMIT_BYTES) {
+              sinceEmit = 0;
+              this.emit();
+            }
+          },
+          onObjectUrl: (url) => this.objectUrls.set(record.downloadId, url),
+        });
+      } catch (err) {
+        outcome = { kind: 'aborted', message: errorMessage(err) };
+      }
+      run.mergeAbort = undefined;
+      if (run.stopRequested) {
+        await this.settleStopped(run, finish);
+        return;
+      }
+      if (outcome.kind === 'aborted') {
+        await finish('paused', 'EXPORT_FAILED', outcome.message);
+        return;
+      }
+      record.exportMode = outcome.kind === 'streamed' ? 'stream' : 'blob';
+      if (outcome.kind === 'streamed') {
+        await this.partStorage.deleteAll(record.downloadId).catch(() => undefined);
+        record.exportedAt = undefined;
+      } else {
+        record.exportedAt = this.now();
+      }
+      this.runs.delete(record.downloadId);
+      release();
+      record.status = 'complete';
+      record.reason = undefined;
+      await this.upsert(record);
+      this.deps.onEvent?.({
+        type: 'complete',
+        record,
+        checksum: compareChecksum(record.verifiedCrc32 ?? '', record.checksumCrc32),
+      });
+      return;
+    }
+  }
+
+  /** Part Blobs in order, each exactly as long as the record says; otherwise `PartMissingError`. */
+  private async collectParts(record: SplitRecord): Promise<Blob[]> {
+    const parts: Blob[] = [];
+    for (const part of [...record.parts].sort((a, b) => a.idx - b.idx)) {
+      const file = await this.partStorage.partFile(record.downloadId, part.idx);
+      const len = partLength(part);
+      if (!file || file.size !== len) throw new PartMissingError(part.idx, file?.size ?? 0, len);
+      parts.push(file);
+    }
+    return parts;
+  }
+
+  /** A part file is not what the record says: re-receive that part (and, for `export`, verify again). */
+  private async forgetPart(record: SplitRecord, err: PartMissingError): Promise<void> {
+    const part = record.parts.find((p) => p.idx === err.partIdx);
+    if (part) {
+      part.done = false;
+      part.receivedBytes = 0;
+      part.committedBytes = 0;
+    }
+    record.verified = false;
+    record.verifiedCrc32 = undefined;
+    record.status = 'running';
+    await this.upsert(record);
+    this.deps.onEvent?.({ type: 'reconciled', record, lostBytes: err.expectedBytes });
+  }
+
+  /** `export`: CRC32 over the parts streamed in order (before anything reaches the browser). */
+  private async verifyParts(
+    run: ActiveRun,
+  ): Promise<
+    { kind: 'ok'; outcome: ChecksumOutcome } | { kind: 'parts-missing' } | { kind: 'error'; message: string }
+  > {
+    const { record } = run;
+    let parts: Blob[];
+    try {
+      parts = await this.collectParts(record);
+    } catch (err) {
+      if (err instanceof PartMissingError) {
+        await this.forgetPart(record, err);
+        return { kind: 'parts-missing' };
+      }
+      return { kind: 'error', message: errorMessage(err) };
+    }
+    const abort = new AbortController();
+    run.mergeAbort = abort;
+    run.verifyProgress = 0;
+    let sinceEmit = 0;
+    let last = 0;
+    try {
+      const outcome = await this.verifyStream(
+        concatParts(parts),
+        record.checksumCrc32,
+        (read) => {
+          run.verifyProgress = record.size > 0 ? Math.min(1, read / record.size) : 1;
+          sinceEmit += read - last;
+          last = read;
+          if (sinceEmit >= MERGE_EMIT_BYTES) {
+            sinceEmit = 0;
+            this.emit();
+          }
+        },
+        abort.signal,
+      );
+      this.emit();
+      return { kind: 'ok', outcome };
+    } catch (err) {
+      return { kind: 'error', message: errorMessage(err) };
+    } finally {
+      run.mergeAbort = undefined;
+    }
   }
 
   /**
@@ -765,7 +1162,7 @@ export class SplitEngine {
     const { record } = run;
     let writable: FileSystemWritableFileStream;
     try {
-      writable = await record.fileHandle.createWritable({ keepExistingData: false });
+      writable = await this.destination(record).createWritable({ keepExistingData: false });
     } catch (err) {
       return { reason: permissionOrFileError(err), message: errorMessage(err) };
     }
@@ -822,7 +1219,7 @@ export class SplitEngine {
   private async migrateToDirect(run: ActiveRun): Promise<void> {
     const { record } = run;
     await this.reconcileOpfs(record);
-    const writable = await record.fileHandle.createWritable({ keepExistingData: false });
+    const writable = await this.destination(record).createWritable({ keepExistingData: false });
     run.writable = writable;
     const abort = new AbortController();
     run.mergeAbort = abort;

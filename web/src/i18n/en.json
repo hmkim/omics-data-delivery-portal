@@ -27,7 +27,7 @@
   "toast": {
     "viaS3": "First download: transferring directly from S3.",
     "viaCloudFront": "Transferring through CloudFront (CDN).",
-    "noResumeInThisBrowser": "This browser cannot resume downloads. If the connection drops, the download restarts from the beginning. Use Chrome or Edge if you need resumable downloads.",
+    "noResumeInThisBrowser": "This browser cannot resume downloads. If the connection drops, the download restarts from the beginning. Use a current Chrome, Edge, Firefox or Safari if you need resumable downloads.",
     "downloadIssueFailed": "Could not issue a download URL: {{message}}",
     "accessDenied": "You do not have permission to download this file.",
     "savePickerCancelled": "Save location selection was cancelled; the download did not start.",
@@ -43,7 +43,14 @@
     "storageFallbackQuota": "Not enough browser temporary storage ({{free}} available), so the file is written directly. If the tab closes or the browser exits, data received since the last pause is downloaded again. This happens in private windows or when the system drive is low on space.",
     "reconciled": "The browser cleared part of the temporary data ({{bytes}}); that range is downloaded again.",
     "migrated": "Temporary storage ran out; the data received so far was moved into the file and the download continues in direct-write mode.",
-    "merging": "All parts received. Merging into the file: {{filename}}"
+    "merging": "All parts received. Merging into the file: {{filename}}",
+    "exporting": "{{filename}} passed verification. Handing it to the browser download — follow the progress in the browser's download list.",
+    "exportHanded": "{{filename}} was handed to the browser download. Once the browser has finished saving it, remove the entry to free the temporary data.",
+    "splitUnavailable": {
+      "OPFS_QUOTA": "The browser's temporary storage cannot hold this file, so split/resumable download is unavailable. Continuing as an ordinary download. Free up space (in Firefox, allow the 'keep site data' request) or use Chrome/Edge for resumable downloads.",
+      "OPFS_UNAVAILABLE": "Temporary storage is not available in this browser (or private window), so split/resumable download is unavailable. Continuing as an ordinary download.",
+      "NO_CAPABILITY": "This browser does not support split/resumable downloads. Continuing as an ordinary download."
+    }
   },
   "badge": {
     "split": "Split · resumable",
@@ -77,7 +84,8 @@
       "verifying": "Verifying integrity",
       "complete": "Complete",
       "failed": "Failed",
-      "merging": "Merging file"
+      "merging": "Merging file",
+      "exporting": "Handing to browser download"
     },
     "reason": {
       "USER": "Paused by you.",
@@ -88,13 +96,21 @@
       "FILE_ERROR": "The file could not be written.",
       "CANCELLED": "Cancelled.",
       "INTERRUPTED": "Interrupted during a previous visit. Resume to continue from the saved point.",
-      "STORAGE_QUOTA": "Browser temporary storage is full. Resuming moves the received data into the file and continues in direct-write mode."
+      "STORAGE_QUOTA": "Browser temporary storage is full. Resuming moves the received data into the file and continues in direct-write mode.",
+      "EXPORT_FAILED": "The hand-over to the browser download failed (cancelled in the browser or an error). The received data is intact; resume to hand it over again."
     },
     "permissionNeeded": "Requesting permission to access the file you selected earlier.",
     "expiresAt": "URL expires {{time}}",
     "diskHintOpfs": "Needs free space equal to the file size ({{size}}) in the browser temporary storage (system drive) and again at the save location. The temporary data is deleted after the merge.",
     "diskHintDirect": "The save location needs at least twice the file size ({{size}}) of free space (the browser makes a temporary copy on resume). Closing the tab re-downloads data received since the last pause.",
-    "mergeProgress": "Merging {{percent}}%"
+    "mergeProgress": "Merging {{percent}}%",
+    "diskHintExport": "The browser's temporary storage (system drive) needs free space equal to the file size ({{size}}). After verification the file is saved to the browser's download folder (no save dialog).",
+    "exportProgress": "Hand-over {{percent}}%",
+    "exportKeepHint": "Once the browser has finished saving, press \"Remove from list\" to delete the temporary data ({{size}}). It is deleted automatically after 24 hours.",
+    "exportAgain": "Hand over again",
+    "reasonExport": {
+      "STORAGE_QUOTA": "The browser's temporary storage is full. Free up space and resume to continue. If space stays short, use Chrome or Edge."
+    }
   },
   "command": {
     "title": "Download with a command",

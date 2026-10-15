@@ -9,14 +9,19 @@ import {
 } from '@genome-portal/contract';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AuthExpiredError } from '../api/client';
+import { crc32Base64FromBytes } from './checksum';
 import { chooseStorage, createMemoryPartStorage, OPFS_QUOTA_MARGIN_BYTES } from './partStorage';
+import type { ExportDelivery, ExportInput, ExportOutcome } from './exportDelivery';
+import type { SplitCapability } from './planner';
 import {
   buildRecord,
+  EXPORT_RETENTION_MS,
   rangeStartFor,
   receivedBytesOf,
   renewDelayMs,
   rollBackToCommitted,
   SplitEngine,
+  SplitUnavailableError,
   type PartRunHandle,
   type PartRunOutcome,
   type RunPartInput,
@@ -253,6 +258,12 @@ function makeEngine(opts: {
   /** default: OPFS unavailable → `direct` storage (what jsdom gives the engine anyway) */
   partStorage?: MemoryStorage;
   store?: SplitStore;
+  /** browser capability; default `picker` (a Chrome with the save dialog, which these tests emulate) */
+  capability?: SplitCapability;
+  /** `export` delivery seam; default records the inputs and answers `streamed` */
+  deliver?: ExportDelivery;
+  /** `export` delivery: force the part-stream checksum outcome; default: real CRC32 over the fake parts */
+  verifyStream?: 'mismatch';
 }) {
   const store = opts.store ?? createMemorySplitStore();
   const partStorage = opts.partStorage ?? memoryStorage({ available: false });
@@ -275,11 +286,19 @@ function makeEngine(opts: {
         renewCount: 1,
       })),
   );
+  const pickFile = vi.fn(async () => handle);
+  const exports: ExportInput[] = [];
+  const deliver: ExportDelivery =
+    opts.deliver ??
+    (async (input) => {
+      exports.push(input);
+      return { kind: 'streamed' } as ExportOutcome;
+    });
   const engine = new SplitEngine({
     store,
     renew,
     runPart: opts.runner,
-    pickFile: async () => handle,
+    pickFile,
     session,
     partStorage,
     partSize: opts.partSize ?? PART_SIZE_BYTES,
@@ -287,10 +306,21 @@ function makeEngine(opts: {
       opts.verify === 'mismatch'
         ? { status: 'mismatch', actual: 'BBBBBB==', expected: 'AAAAAA==' }
         : { status: 'ok', actual: 'AAAAAA==' },
+    ...(opts.verifyStream === 'mismatch'
+      ? {
+          verifyStream: async () => ({
+            status: 'mismatch' as const,
+            actual: 'BBBBBB==',
+            expected: 'AAAAAA==',
+          }),
+        }
+      : {}),
+    deliver,
+    capability: () => opts.capability ?? 'picker',
     onEvent: (e) => events.push(e),
     maxPartRetries: 1,
   });
-  return { engine, store, partStorage, session, events, handle, renew };
+  return { engine, store, partStorage, session, events, handle, renew, pickFile, exports };
 }
 
 const flush = async (n = 10) => {
@@ -885,5 +915,373 @@ describe('SplitEngine — OPFS storage (plan A)', () => {
     expect(calls).toHaveLength(0);
     expect((await store.get('dl-1'))?.status).toBe('complete');
     expect(handle.committed.byteLength).toBe(2048);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D8: export delivery (browsers without the File System Access API — Firefox, Safari, Brave)
+// ---------------------------------------------------------------------------
+
+describe('SplitEngine — export delivery (D8, design §5.4)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-14T00:00:00Z'));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** the S3-style checksum of `size` bytes of value 2 (what the fake OPFS part runner writes) */
+  const crcOf = (size: number) => crc32Base64FromBytes(new Uint8Array(size).fill(2));
+  /** an issued download whose checksum matches the fake parts (the export path hashes for real) */
+  const issuedExport = async (size: number) => issuedFor(size, { checksumCrc32: await crcOf(size) });
+
+  /** bytes of every fake part concatenated in order (what the browser must receive) */
+  const concatenated = async (parts: Blob[]) => {
+    const chunks = await Promise.all(parts.map(async (p) => new Uint8Array(await p.arrayBuffer())));
+    const out = new Uint8Array(chunks.reduce((s, c) => s + c.byteLength, 0));
+    let at = 0;
+    for (const c of chunks) {
+      out.set(c, at);
+      at += c.byteLength;
+    }
+    return out;
+  };
+
+  it('start(): no save picker, record has delivery=export, storage=opfs and no fileHandle', async () => {
+    const partStorage = memoryStorage();
+    const { runner } = fakeRunner(fullOpfsPart(partStorage));
+    const { engine, pickFile } = makeEngine({ runner, partSize: 1024, partStorage, capability: 'export' });
+    const record = await engine.start(issuedFor(2500), 'bucket', 'p/sample.bam');
+    expect(pickFile).not.toHaveBeenCalled();
+    expect(record.delivery).toBe('export');
+    expect(record.storage).toBe('opfs');
+    expect(record.fileHandle).toBeUndefined();
+    expect(partStorage.persistCalls).toBe(1);
+  });
+
+  it('stream export: parts → verified (CRC32 over the part stream) → exporting → complete; parts deleted', async () => {
+    const partStorage = memoryStorage();
+    const { runner, calls } = fakeRunner(fullOpfsPart(partStorage));
+    const { engine, store, events, exports, session, handle } = makeEngine({
+      runner,
+      partSize: 1024,
+      partStorage,
+      capability: 'export',
+    });
+    await engine.start(issuedFor(2500, { checksumCrc32: undefined }), 'bucket', 'p/sample.bam');
+    await flush(40);
+    const final = await store.get('dl-1');
+    expect(final?.status).toBe('complete');
+    expect(final?.verified).toBe(true);
+    expect(final?.verifiedCrc32).toMatch(/^[A-Za-z0-9+/]{6}==$/);
+    expect(final?.exportMode).toBe('stream');
+    expect(final?.exportedAt).toBeUndefined();
+    expect(calls).toHaveLength(3);
+    // the hand-over got every part, in order, with the exact total size
+    expect(exports).toHaveLength(1);
+    expect(exports[0]?.filename).toBe('sample.bam');
+    expect(exports[0]?.size).toBe(2500);
+    expect(exports[0]?.parts.map((p) => p.size)).toEqual([1024, 1024, 452]);
+    const bytes = await concatenated(exports[0]!.parts);
+    expect(bytes.byteLength).toBe(2500);
+    expect(bytes.every((b) => b === 2)).toBe(true);
+    // nothing touched a destination file; the parts are gone once the stream ended
+    expect(handle.createWritable).not.toHaveBeenCalled();
+    expect(partStorage.parts.size).toBe(0);
+    expect(types(events)).toEqual(['started', 'exporting', 'complete']);
+    const complete = events.find((e) => e.type === 'complete');
+    expect(complete && complete.type === 'complete' && complete.checksum.status).toBe('unverifiable');
+    expect(session.active).toBe(0);
+  });
+
+  it('verification runs before the hand-over: a checksum mismatch fails the download and exports nothing', async () => {
+    const partStorage = memoryStorage();
+    const { runner } = fakeRunner(fullOpfsPart(partStorage));
+    const { engine, store, exports, events } = makeEngine({
+      runner,
+      partSize: 1024,
+      partStorage,
+      capability: 'export',
+      verifyStream: 'mismatch',
+    });
+    await engine.start(await issuedExport(2048), 'b', 'k');
+    await flush(40);
+    const final = await store.get('dl-1');
+    expect(final?.status).toBe('failed');
+    expect(final?.reason).toBe('CHECKSUM_MISMATCH');
+    expect(final?.verified).toBeFalsy();
+    expect(exports).toHaveLength(0);
+    expect(types(events)).toEqual(['started', 'failed']);
+  });
+
+  it('blob export: complete with exportedAt, parts KEPT; remove() deletes them; exportAgain() re-hands the parts', async () => {
+    const partStorage = memoryStorage();
+    const { runner } = fakeRunner(fullOpfsPart(partStorage));
+    const handed: ExportInput[] = [];
+    const deliver: ExportDelivery = async (input) => {
+      handed.push(input);
+      input.onObjectUrl?.('blob:https://portal/abc');
+      return { kind: 'handed' };
+    };
+    const revoke = vi.fn();
+    const urlCtor = URL as unknown as { revokeObjectURL?: (u: string) => void };
+    const previousRevoke = urlCtor.revokeObjectURL;
+    urlCtor.revokeObjectURL = revoke;
+    const { engine, store, events } = makeEngine({
+      runner,
+      partSize: 1024,
+      partStorage,
+      capability: 'export',
+      deliver,
+    });
+    await engine.start(await issuedExport(2048), 'b', 'k');
+    await flush(40);
+    const final = await store.get('dl-1');
+    expect(final?.status).toBe('complete');
+    expect(final?.exportMode).toBe('blob');
+    expect(final?.exportedAt).toBe(Date.parse('2026-10-14T00:00:00Z'));
+    expect(partStorage.parts.size).toBe(2); // the browser is still reading them
+    expect(types(events)).toEqual(['started', 'exporting', 'complete']);
+
+    await engine.exportAgain('dl-1');
+    await flush(20);
+    expect(handed).toHaveLength(2);
+    expect(revoke).toHaveBeenCalledWith('blob:https://portal/abc');
+    expect((await store.get('dl-1'))?.status).toBe('complete');
+
+    await engine.remove('dl-1');
+    expect(partStorage.parts.size).toBe(0);
+    expect(await store.get('dl-1')).toBeUndefined();
+    expect(revoke).toHaveBeenCalledTimes(2);
+    urlCtor.revokeObjectURL = previousRevoke;
+  });
+
+  it('load(): a blob export older than the retention window is purged with its part files; a younger one is kept', async () => {
+    const partStorage = memoryStorage();
+    const store = createMemorySplitStore();
+    const { runner } = fakeRunner(fullOpfsPart(partStorage));
+    const deliver: ExportDelivery = async () => ({ kind: 'handed' });
+    const s1 = makeEngine({ runner, partSize: 1024, partStorage, store, capability: 'export', deliver });
+    await s1.engine.start(await issuedExport(2048), 'b', 'k');
+    await flush(40);
+    expect((await store.get('dl-1'))?.exportMode).toBe('blob');
+
+    vi.setSystemTime(new Date(Date.parse('2026-10-14T00:00:00Z') + EXPORT_RETENTION_MS - 1));
+    const s2 = makeEngine({ runner, partSize: 1024, partStorage, store, capability: 'export', deliver });
+    expect(await s2.engine.load()).toHaveLength(1);
+    expect(partStorage.parts.size).toBe(2);
+
+    vi.setSystemTime(new Date(Date.parse('2026-10-14T00:00:00Z') + EXPORT_RETENTION_MS));
+    const s3 = makeEngine({ runner, partSize: 1024, partStorage, store, capability: 'export', deliver });
+    expect(await s3.engine.load()).toHaveLength(0);
+    expect(partStorage.parts.size).toBe(0);
+    expect(await store.get('dl-1')).toBeUndefined();
+  });
+
+  it('a part evicted before verification is re-received, then verified and exported', async () => {
+    const partStorage = memoryStorage();
+    const { runner, calls } = fakeRunner(async (input) => {
+      writePart(partStorage, input);
+      // part 1 disappears right after it was reported complete (browser evicted site data)
+      if (input.partIdx === 1 && calls.filter((c) => c.partIdx === 1).length === 1) {
+        partStorage.parts.delete('dl-1/1');
+      }
+      return { kind: 'done' };
+    });
+    const { engine, store, events, exports } = makeEngine({
+      runner,
+      partSize: 1024,
+      partStorage,
+      capability: 'export',
+    });
+    await engine.start(await issuedExport(2500), 'b', 'k');
+    await flush(60);
+    const final = await store.get('dl-1');
+    expect(final?.status).toBe('complete');
+    expect(calls.filter((c) => c.partIdx === 1).map((c) => [c.from, c.to])).toEqual([
+      [1024, 2047],
+      [1024, 2047], // re-received from its start
+    ]);
+    expect(exports).toHaveLength(1);
+    expect((await concatenated(exports[0]!.parts)).byteLength).toBe(2500);
+    const reconciled = events.find((e) => e.type === 'reconciled');
+    expect(reconciled && reconciled.type === 'reconciled' && reconciled.lostBytes).toBe(1024);
+    expect(types(events)).toEqual(['started', 'reconciled', 'exporting', 'complete']);
+  });
+
+  it('hand-over aborted by the browser → paused/EXPORT_FAILED with parts intact; resume only repeats the export', async () => {
+    const partStorage = memoryStorage();
+    const { runner, calls } = fakeRunner(fullOpfsPart(partStorage));
+    let attempt = 0;
+    const deliver: ExportDelivery = async () => {
+      attempt += 1;
+      return attempt === 1 ? { kind: 'aborted', message: 'cancelled by the browser' } : { kind: 'streamed' };
+    };
+    const { engine, store, events } = makeEngine({
+      runner,
+      partSize: 1024,
+      partStorage,
+      capability: 'export',
+      deliver,
+    });
+    await engine.start(await issuedExport(2048), 'b', 'k');
+    await flush(40);
+    let rec = await store.get('dl-1');
+    expect(rec?.status).toBe('paused');
+    expect(rec?.reason).toBe('EXPORT_FAILED');
+    expect(rec?.message).toBe('cancelled by the browser');
+    expect(rec?.verified).toBe(true);
+    expect(partStorage.parts.size).toBe(2);
+    expect(calls).toHaveLength(2);
+
+    await engine.resume('dl-1');
+    await flush(40);
+    rec = await store.get('dl-1');
+    expect(rec?.status).toBe('complete');
+    expect(rec?.exportMode).toBe('stream');
+    expect(calls).toHaveLength(2); // nothing re-downloaded
+    expect(partStorage.parts.size).toBe(0);
+    expect(types(events)).toEqual(['started', 'exporting', 'paused', 'started', 'exporting', 'complete']);
+  });
+
+  it('a record interrupted while exporting (tab closed) → paused/INTERRUPTED, verified stays, resume exports only', async () => {
+    const partStorage = memoryStorage();
+    const store = createMemorySplitStore();
+    const { runner, calls } = fakeRunner(fullOpfsPart(partStorage));
+    // session 1: the hand-over never settles (the page died mid-stream)
+    const s1 = makeEngine({
+      runner,
+      partSize: 1024,
+      partStorage,
+      store,
+      capability: 'export',
+      deliver: () => new Promise<ExportOutcome>(() => undefined),
+    });
+    await s1.engine.start(await issuedExport(2048), 'b', 'k');
+    await flush(40);
+    expect((await store.get('dl-1'))?.status).toBe('exporting');
+
+    const s2 = makeEngine({ runner, partSize: 1024, partStorage, store, capability: 'export' });
+    const [loaded] = await s2.engine.load();
+    expect(loaded?.status).toBe('paused');
+    expect(loaded?.reason).toBe('INTERRUPTED');
+    expect(loaded?.verified).toBe(true);
+    await s2.engine.resume('dl-1');
+    await flush(40);
+    expect((await store.get('dl-1'))?.status).toBe('complete');
+    expect(calls).toHaveLength(2); // the parts were durable: no transfer in session 2
+    expect(s2.exports).toHaveLength(1);
+    expect(types(s2.events)).toEqual(['started', 'exporting', 'complete']);
+  });
+
+  it('start(): export delivery without a usable OPFS throws SplitUnavailableError (quota / unavailable / no capability)', async () => {
+    const { runner } = fakeRunner(fullOpfsPart(memoryStorage()));
+    const quota = makeEngine({
+      runner,
+      partSize: 1024,
+      partStorage: memoryStorage({ capacity: 1000 }),
+      capability: 'export',
+    });
+    await expect(quota.engine.start(await issuedExport(2048), 'b', 'k')).rejects.toMatchObject({
+      name: 'SplitUnavailableError',
+      reason: 'OPFS_QUOTA',
+    });
+    const none = makeEngine({
+      runner,
+      partSize: 1024,
+      partStorage: memoryStorage({ available: false }),
+      capability: 'export',
+    });
+    await expect(none.engine.start(await issuedExport(2048), 'b', 'k')).rejects.toMatchObject({
+      reason: 'OPFS_UNAVAILABLE',
+    });
+    const noCap = makeEngine({ runner, partSize: 1024, partStorage: memoryStorage(), capability: 'none' });
+    const err = await noCap.engine.start(await issuedExport(2048), 'b', 'k').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SplitUnavailableError);
+    expect((err as SplitUnavailableError).reason).toBe('NO_CAPABILITY');
+    expect(await quota.store.get('dl-1')).toBeUndefined(); // nothing persisted
+  });
+
+  it('quota exhausted while writing a part → paused/STORAGE_QUOTA; resume retries in OPFS (no migration to direct)', async () => {
+    const partStorage = memoryStorage();
+    let failOnce = true;
+    const { runner, calls } = fakeRunner(async (input) => {
+      if (input.partIdx === 1 && failOnce) {
+        failOnce = false;
+        writePart(partStorage, input, 512);
+        return { kind: 'error', fileError: true, quota: true, message: 'QuotaExceededError' };
+      }
+      writePart(partStorage, input);
+      return { kind: 'done' };
+    });
+    const { engine, store, events, handle } = makeEngine({
+      runner,
+      partSize: 1024,
+      partStorage,
+      capability: 'export',
+    });
+    await engine.start(await issuedExport(2048), 'b', 'k');
+    await flush(40);
+    let rec = await store.get('dl-1');
+    expect(rec?.status).toBe('paused');
+    expect(rec?.reason).toBe('STORAGE_QUOTA');
+    expect(rec?.storage).toBe('opfs');
+
+    await engine.resume('dl-1');
+    await flush(40);
+    rec = await store.get('dl-1');
+    expect(rec?.status).toBe('complete');
+    expect(rec?.storage).toBe('opfs'); // still OPFS
+    expect(handle.createWritable).not.toHaveBeenCalled(); // no destination, no migration
+    expect(calls.filter((c) => c.partIdx === 1).map((c) => c.from)).toEqual([1024, 1024 + 512]);
+    expect(types(events)).not.toContain('migrated');
+  });
+
+  it('cancel() during an export download deletes the part files and the record without touching any file handle', async () => {
+    const partStorage = memoryStorage();
+    const { runner } = fakeRunner(async (input) => {
+      writePart(partStorage, input, 256);
+      return 'hang';
+    });
+    const { engine, store, events, handle } = makeEngine({
+      runner,
+      partSize: 1024,
+      partStorage,
+      capability: 'export',
+    });
+    await engine.start(await issuedExport(2048), 'b', 'k');
+    await flush();
+    expect(partStorage.parts.size).toBe(2);
+    await engine.cancel('dl-1');
+    expect(partStorage.parts.size).toBe(0);
+    expect(await store.get('dl-1')).toBeUndefined();
+    expect(handle.createWritable).not.toHaveBeenCalled();
+    expect(types(events)).toEqual(['started', 'cancelled']);
+  });
+
+  it('cancel() while the hand-over is in flight aborts the delivery signal', async () => {
+    const partStorage = memoryStorage();
+    const { runner } = fakeRunner(fullOpfsPart(partStorage));
+    let seenSignal: AbortSignal | undefined;
+    const deliver: ExportDelivery = (input) =>
+      new Promise<ExportOutcome>((resolve) => {
+        seenSignal = input.signal;
+        input.signal?.addEventListener('abort', () => resolve({ kind: 'aborted', message: 'aborted' }));
+      });
+    const { engine, store } = makeEngine({
+      runner,
+      partSize: 1024,
+      partStorage,
+      capability: 'export',
+      deliver,
+    });
+    await engine.start(await issuedExport(2048), 'b', 'k');
+    await flush(40);
+    expect((await store.get('dl-1'))?.status).toBe('exporting');
+    await engine.cancel('dl-1');
+    expect(seenSignal?.aborted).toBe(true);
+    expect(await store.get('dl-1')).toBeUndefined();
+    expect(partStorage.parts.size).toBe(0);
   });
 });

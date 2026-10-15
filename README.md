@@ -5,7 +5,7 @@ All AWS resource identifiers use the `genome-portal-` prefix.
 
 - **UI**: [Storage Browser for Amazon S3](https://ui.docs.amplify.aws/react/connected-components/storage/storage-browser) (customer-managed auth) behind an **Amazon Cognito** login, branded like the Transfer Family web app.
 - **Access**: per-organisation S3 prefixes, read-only, credentials issued by **S3 Access Grants**.
-- **Delivery**: first download of an object goes straight to S3, every later download goes through **CloudFront** (Pro flat-rate plan, OAC, signed URLs). Files over 1 GiB use a resumable Range split download in the browser; files over 50 GB fall back to aria2c/curl commands on browsers without the File System Access API.
+- **Delivery**: first download of an object goes straight to S3, every later download goes through **CloudFront** (Pro flat-rate plan, OAC, signed URLs). Files over 1 GiB use a resumable Range split download in the browser: parts are kept durable in the origin-private file system and either merged into a file the user picks (Chrome/Edge, File System Access API) or, where that API is missing (Firefox 111+, Safari 17+, Brave), verified and handed to the browser's ordinary download (`docs/design-notes/2026-10-14_split_export_firefox_safari.md`). Browsers without OPFS get a plain download, or aria2c/curl commands above 50 GB.
 
 Design documents (Korean): [`docs/spec/requirements.md`](docs/spec/requirements.md) and
 [`docs/spec/design.md`](docs/spec/design.md). The `R#`, `N#`, `D#` and `§#` references in code, tests and docs point

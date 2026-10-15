@@ -3,6 +3,7 @@ import type { DownloadResponse } from '@genome-portal/contract';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiRequestError } from '../api/client';
 import { createPortalDownloadHandler } from './handler';
+import { SplitUnavailableError } from './splitEngine';
 
 const GiB = 1024 ** 3;
 
@@ -27,7 +28,7 @@ const input = (): DownloadHandlerInput => ({
   all: [],
 });
 
-function setup(size: number, fsAccess: boolean, path: 'S3' | 'CF' = 'S3') {
+function setup(size: number, fsAccess: boolean | 'export', path: 'S3' | 'CF' = 'S3') {
   const api = { issueDownload: vi.fn(async () => issued(size, path)) };
   const engine = { start: vi.fn(async () => ({}) as never) };
   const anchor = vi.fn();
@@ -41,7 +42,7 @@ function setup(size: number, fsAccess: boolean, path: 'S3' | 'CF' = 'S3') {
     toast,
     t: (k) => k,
     plannerOptions: {
-      hasFileSystemAccess: fsAccess,
+      ...(fsAccess === 'export' ? { capability: 'export' as const } : { hasFileSystemAccess: fsAccess }),
       settings: { splitThresholdBytes: GiB, singleObjectLimitBytes: 50_000_000_000 },
     },
   });
@@ -86,6 +87,47 @@ describe('portalDownloadHandler (T3.6, §5.2)', () => {
       key: 'p/f.bam',
     });
     expect(s.engine.start).not.toHaveBeenCalled();
+  });
+
+  it('export capability (D8): 12 GiB and 150 GB both start the engine, no R5.9 toast, no command dialog', async () => {
+    for (const size of [12 * GiB, 150_000_000_000]) {
+      const s = setup(size, 'export');
+      await s.handler(input()).result;
+      expect(s.engine.start).toHaveBeenCalledTimes(1);
+      expect(s.anchor).not.toHaveBeenCalled();
+      expect(s.openCommand).not.toHaveBeenCalled();
+      expect(s.toast.mock.calls.map((c) => c[0])).toEqual(['toast.viaS3']);
+    }
+  });
+
+  it('SplitUnavailableError (OPFS quota) → ordinary download + reason toast + R5.9 hint below 50 GB', async () => {
+    const s = setup(12 * GiB, 'export');
+    s.engine.start.mockRejectedValueOnce(new SplitUnavailableError('OPFS_QUOTA'));
+    const out = await s.handler(input()).result;
+    expect(out.status).toBe('COMPLETE');
+    expect(s.anchor).toHaveBeenCalledWith('https://x/y', 'f.bam');
+    expect(s.openCommand).not.toHaveBeenCalled();
+    expect(s.toast.mock.calls.map((c) => c[0])).toEqual([
+      'toast.viaS3',
+      'toast.splitUnavailable.OPFS_QUOTA',
+      'toast.noResumeInThisBrowser',
+    ]);
+  });
+
+  it('SplitUnavailableError (no OPFS) above 50 GB → command dialog + reason toast', async () => {
+    const s = setup(150_000_000_000, 'export');
+    s.engine.start.mockRejectedValueOnce(new SplitUnavailableError('OPFS_UNAVAILABLE'));
+    await s.handler(input()).result;
+    expect(s.anchor).not.toHaveBeenCalled();
+    expect(s.openCommand).toHaveBeenCalledWith({
+      issued: expect.objectContaining({ sizeBytes: 150_000_000_000 }),
+      bucket: 'bkt',
+      key: 'p/f.bam',
+    });
+    expect(s.toast.mock.calls.map((c) => c[0])).toEqual([
+      'toast.viaS3',
+      'toast.splitUnavailable.OPFS_UNAVAILABLE',
+    ]);
   });
 
   it('403 → FAILED with access-denied toast; save picker dismissal → CANCELED', async () => {
